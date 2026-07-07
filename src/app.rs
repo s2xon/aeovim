@@ -667,13 +667,15 @@ impl App {
         self.sidebar_to(self.cur_id());
     }
 
-    /// Space e: toggle sidebar visibility. Focus is handled by Ctrl-h / Ctrl-l.
+    /// Space e: toggle the sidebar and move focus with it — open focuses the
+    /// sidebar, close focuses the chat window.
     fn toggle_sidebar(&mut self) {
         self.sidebar_open = !self.sidebar_open;
-        if !self.sidebar_open && self.focus == Focus::Sidebar {
-            self.focus = Focus::Main;
-        } else if self.sidebar_open {
+        if self.sidebar_open {
+            self.focus = Focus::Sidebar;
             self.sidebar_to(self.cur_id());
+        } else {
+            self.focus = Focus::Main;
         }
     }
 
