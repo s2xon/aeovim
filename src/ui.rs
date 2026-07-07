@@ -38,22 +38,28 @@ pub fn render(f: &mut Frame, app: &mut App) {
     if app.sidebar_open && side_w > 0 {
         render_sidebar(f, cols[0], app);
     }
-    if app.spaces.is_empty() {
-        render_empty(f, cols[1]);
-        if app.help_open {
-            render_help(f, area);
-        }
-        return;
-    }
     let rows = Layout::vertical([
         Constraint::Min(3),
         Constraint::Length(1), // lualine status
         Constraint::Length(3), // prompt (flush to bottom)
     ])
     .split(cols[1]);
+    if app.spaces.is_empty() {
+        render_empty(f, rows[0]);
+        render_status(f, rows[1], app); // keep the mode indicator
+        render_composer(f, rows[2], app); // and the command/prompt line (:q works)
+        if app.help_open {
+            render_help(f, area);
+        }
+        return;
+    }
     render_active_space(f, rows[0], app);
     render_status(f, rows[1], app);
     render_composer(f, rows[2], app);
+
+    if app.slash_active() {
+        render_slash_popup(f, rows[2], app);
+    }
 
     if app.help_open {
         render_help(f, area);
@@ -483,15 +489,97 @@ fn md_line(prefix: &str, text: &str, base: Style) -> Line<'static> {
             ),
         ]);
     }
+    // bullet lists
+    let bullet = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+        .or_else(|| trimmed.strip_prefix("+ "));
+    if let Some(rest) = bullet {
+        let mut spans = vec![Span::styled(format!("{prefix}• "), Style::default().fg(t::PERI))];
+        spans.extend(md_spans(rest, base));
+        return Line::from(spans);
+    }
+    // blockquote
+    if let Some(rest) = trimmed.strip_prefix("> ") {
+        return Line::from(vec![
+            Span::styled(format!("{prefix}▏ "), Style::default().fg(t::GUTTER)),
+            Span::styled(rest.to_string(), Style::default().fg(t::DIM).add_modifier(Modifier::ITALIC)),
+        ]);
+    }
     let mut spans = vec![Span::styled(prefix.to_string(), base)];
     spans.extend(md_spans(text, base));
     Line::from(spans)
 }
 
+fn render_slash_popup(f: &mut Frame, composer: Rect, app: &App) {
+    let matches = app.slash_matches();
+    let shown = matches.len().clamp(1, 8) as u16;
+    let w = 40u16.min(composer.width);
+    let h = shown + 2;
+    let y = composer.y.saturating_sub(h);
+    let rect = Rect {
+        x: composer.x,
+        y,
+        width: w,
+        height: h,
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(t::BORDER))
+        .title(Span::styled(
+            " commands ",
+            Style::default().fg(t::PURPLE).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(rect);
+    f.render_widget(Clear, rect);
+    f.render_widget(block, rect);
+
+    let win = inner.height as usize;
+    let start = if app.slash_sel >= win {
+        app.slash_sel + 1 - win
+    } else {
+        0
+    };
+    let lines: Vec<Line> = matches
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(win)
+        .map(|(i, cmd)| {
+            let selected = i == app.slash_sel;
+            let caret = if selected { "› " } else { "  " };
+            let st = if selected {
+                Style::default().fg(t::PINK).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(t::FG)
+            };
+            Line::from(Span::styled(format!("{caret}/{cmd}"), st))
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
 fn push_block(out: &mut Vec<Line<'static>>, label: &str, lbl: Style, text: &str, body: Style) {
     out.push(Line::from(Span::styled(label.to_string(), lbl)));
+    let mut in_fence = false;
     for l in text.split('\n') {
-        out.push(md_line("  ", l, body));
+        if l.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            out.push(Line::from(Span::styled(
+                "  ┄┄┄┄".to_string(),
+                Style::default().fg(t::GUTTER),
+            )));
+            continue;
+        }
+        if in_fence {
+            out.push(Line::from(Span::styled(
+                format!("  {l}"),
+                Style::default().fg(t::PERI),
+            )));
+        } else {
+            out.push(md_line("  ", l, body));
+        }
     }
 }
 
@@ -558,6 +646,23 @@ fn render_status(f: &mut Frame, area: Rect, app: &App) {
         Mode::Picker => ("FIND", t::MODE_VISUAL),
         Mode::Confirm => ("CONFIRM", t::RED),
     };
+    if app.spaces.is_empty() {
+        let line = Line::from(vec![
+            Span::styled(
+                format!(" {label} "),
+                Style::default()
+                    .fg(t::PANEL)
+                    .bg(mode_col)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "  no spaces — press n to start ",
+                Style::default().fg(t::DIM),
+            ),
+        ]);
+        f.render_widget(Paragraph::new(line), area);
+        return;
+    }
     let sp = &app.spaces[app.active_space];
     let c = app.cur_chat();
     let where_ = if sp.chats.len() > 1 {

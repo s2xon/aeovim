@@ -219,6 +219,8 @@ pub struct App {
     pub should_quit: bool,
     pub spinner: usize,
     pub help_open: bool,
+    pub slash_commands: Vec<String>,
+    pub slash_sel: usize,
     next_chat_id: u64,
     next_space_id: u64,
     chat_counter: u64,
@@ -287,6 +289,8 @@ impl App {
             should_quit: false,
             spinner: 0,
             help_open: false,
+            slash_commands: Vec::new(),
+            slash_sel: 0,
             next_chat_id,
             next_space_id,
             chat_counter,
@@ -380,14 +384,18 @@ impl App {
     fn handle_agent(&mut self, id: u64, ev: AgentEvent) {
         let is_result = matches!(ev, AgentEvent::TurnResult { .. });
         let mut model_update = None;
+        let mut slash_update = None;
         if let Some(c) = self.chat_by_id_mut(id) {
             match ev {
-                AgentEvent::Init { session_id, model } => {
+                AgentEvent::Init { session_id, model, slash_commands } => {
                     if let Some(s) = session_id {
                         c.session_id = s;
                     }
                     if let Some(m) = model {
                         model_update = Some(m);
+                    }
+                    if !slash_commands.is_empty() {
+                        slash_update = Some(slash_commands);
                     }
                 }
                 AgentEvent::TextDelta(s) => {
@@ -435,6 +443,9 @@ impl App {
         self.spinner = self.spinner.wrapping_add(1);
         if let Some(m) = model_update {
             self.model_display = m;
+        }
+        if let Some(sc) = slash_update {
+            self.slash_commands = sc;
         }
         if is_result {
             self.persist();
@@ -502,17 +513,99 @@ impl App {
     }
 
     fn key_insert(&mut self, k: KeyEvent, ctrl: bool) {
+        // slash-command popup navigation (when typing "/..." with no space yet)
+        if self.slash_active() {
+            match k.code {
+                KeyCode::Down => {
+                    self.slash_move(1);
+                    return;
+                }
+                KeyCode::Up => {
+                    self.slash_move(-1);
+                    return;
+                }
+                KeyCode::Char('n') | KeyCode::Char('j') if ctrl => {
+                    self.slash_move(1);
+                    return;
+                }
+                KeyCode::Char('p') | KeyCode::Char('k') if ctrl => {
+                    self.slash_move(-1);
+                    return;
+                }
+                KeyCode::Tab | KeyCode::Enter => {
+                    self.slash_complete();
+                    return;
+                }
+                _ => {}
+            }
+        }
         match k.code {
             KeyCode::Esc => self.mode = Mode::Normal,
             KeyCode::Enter => self.send_prompt(),
             KeyCode::Backspace => {
                 self.input.pop();
+                self.slash_sel = 0;
             }
-            KeyCode::Char('u') if ctrl => self.input.clear(),
+            KeyCode::Char('u') if ctrl => {
+                self.input.clear();
+                self.slash_sel = 0;
+            }
             KeyCode::Char('c') if ctrl => self.should_quit = true,
-            KeyCode::Char(c) => self.input.push(c),
+            KeyCode::Char(c) => {
+                self.input.push(c);
+                self.slash_sel = 0;
+            }
             _ => {}
         }
+    }
+
+    fn all_slash_commands(&self) -> Vec<String> {
+        const DEFAULT: &[&str] = &[
+            "init", "review", "security-review", "pr-comments", "compact", "context",
+            "cost", "agents", "mcp", "memory", "model", "todos", "help", "clear",
+        ];
+        let mut v: Vec<String> = DEFAULT.iter().map(|s| s.to_string()).collect();
+        for c in &self.slash_commands {
+            if !v.iter().any(|x| x == c) {
+                v.push(c.clone());
+            }
+        }
+        v.sort();
+        v.dedup();
+        v
+    }
+
+    pub fn slash_matches(&self) -> Vec<String> {
+        let q = self.input.trim_start_matches('/').to_lowercase();
+        self.all_slash_commands()
+            .into_iter()
+            .filter(|c| q.is_empty() || c.to_lowercase().contains(&q))
+            .collect()
+    }
+
+    pub fn slash_active(&self) -> bool {
+        self.mode == Mode::Insert
+            && self.input.starts_with('/')
+            && !self.input.contains(char::is_whitespace)
+            && !self.slash_matches().is_empty()
+    }
+
+    fn slash_move(&mut self, d: isize) {
+        let n = self.slash_matches().len();
+        if n == 0 {
+            return;
+        }
+        let cur = self.slash_sel.min(n - 1) as isize;
+        self.slash_sel = (cur + d).rem_euclid(n as isize) as usize;
+    }
+
+    fn slash_complete(&mut self) {
+        let matches = self.slash_matches();
+        let sel = self.slash_sel.min(matches.len().saturating_sub(1));
+        if let Some(cmd) = matches.get(sel) {
+            self.input = format!("/{cmd} ");
+        }
+        self.slash_sel = 0;
     }
 
     fn key_picker(&mut self, k: KeyEvent, ctrl: bool) {

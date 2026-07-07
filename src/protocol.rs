@@ -15,6 +15,7 @@ pub enum AgentEvent {
     Init {
         session_id: Option<String>,
         model: Option<String>,
+        slash_commands: Vec<String>,
     },
     /// A token-level text delta (`content_block_delta` / `text_delta`).
     TextDelta(String),
@@ -46,9 +47,20 @@ pub fn parse_line(line: &str) -> AgentEvent {
     match v.get("type").and_then(Value::as_str).unwrap_or("") {
         "system" => {
             if v.get("subtype").and_then(Value::as_str) == Some("init") {
+                let slash_commands = v
+                    .get("slash_commands")
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str())
+                            .map(|s| s.trim_start_matches('/').to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 AgentEvent::Init {
                     session_id: v.get("session_id").and_then(Value::as_str).map(String::from),
                     model: v.get("model").and_then(Value::as_str).map(String::from),
+                    slash_commands,
                 }
             } else {
                 // hook_started / hook_response / status — quiet in the skeleton.
