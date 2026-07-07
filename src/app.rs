@@ -680,13 +680,12 @@ impl App {
             Pending::LeaderT => {
                 self.pending = Pending::None;
                 match k.code {
+                    KeyCode::Char('n') => self.add_chat_to_active(),
                     KeyCode::Char('o') | KeyCode::Char('f') => {
                         self.new_space();
                         self.mode = Mode::Insert;
                     }
                     KeyCode::Char('x') => self.close_focused_pane(),
-                    KeyCode::Char('n') => self.pane_cycle(1),
-                    KeyCode::Char('p') => self.pane_cycle(-1),
                     _ => {}
                 }
             }
@@ -747,7 +746,19 @@ impl App {
                 (SplitDir::H, Dir::Left) => Some(usize::MAX),
                 _ => None,
             }
+        } else if n == 3 {
+            // TL=0, TR=1, bottom=2 (full width)
+            match dir {
+                Dir::Left => match cur {
+                    1 => Some(0),
+                    _ => Some(usize::MAX),
+                },
+                Dir::Right => (cur == 0).then_some(1),
+                Dir::Down => (cur == 0 || cur == 1).then_some(2),
+                Dir::Up => (cur == 2).then_some(0),
+            }
         } else {
+            // 2x2: TL=0 TR=1 BL=2 BR=3
             match dir {
                 Dir::Left => match cur {
                     1 => Some(0),

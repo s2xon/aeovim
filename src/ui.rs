@@ -134,113 +134,141 @@ fn render_sidebar(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
-fn pane_rects(area: Rect, n: usize, dir: SplitDir) -> Vec<Rect> {
-    use Constraint::Percentage as P;
+// Chats inside a space are split by a single thin divider — not boxed.
+// Returns the pane rects plus divider rects (bool = horizontal line).
+fn space_layout(inner: Rect, n: usize, dir: SplitDir) -> (Vec<Rect>, Vec<(Rect, bool)>) {
+    use Constraint::{Length, Min};
     match n {
-        0 | 1 => vec![area],
+        0 | 1 => (vec![inner], Vec::new()),
         2 => match dir {
-            SplitDir::V => Layout::horizontal([P(50), P(50)]).spacing(1).split(area).to_vec(),
-            SplitDir::H => Layout::vertical([P(50), P(50)]).spacing(1).split(area).to_vec(),
+            SplitDir::V => {
+                let p = Layout::horizontal([Min(1), Length(1), Min(1)]).split(inner);
+                (vec![p[0], p[2]], vec![(p[1], false)])
+            }
+            SplitDir::H => {
+                let p = Layout::vertical([Min(1), Length(1), Min(1)]).split(inner);
+                (vec![p[0], p[2]], vec![(p[1], true)])
+            }
         },
         3 => {
-            let rows = Layout::vertical([P(50), P(50)]).spacing(1).split(area);
-            let top = Layout::horizontal([P(50), P(50)]).spacing(1).split(rows[0]);
-            vec![top[0], top[1], rows[1]]
+            let rows = Layout::vertical([Min(1), Length(1), Min(1)]).split(inner);
+            let top = Layout::horizontal([Min(1), Length(1), Min(1)]).split(rows[0]);
+            (
+                vec![top[0], top[2], rows[2]],
+                vec![(rows[1], true), (top[1], false)],
+            )
         }
         _ => {
-            let rows = Layout::vertical([P(50), P(50)]).spacing(1).split(area);
-            let top = Layout::horizontal([P(50), P(50)]).spacing(1).split(rows[0]);
-            let bot = Layout::horizontal([P(50), P(50)]).spacing(1).split(rows[1]);
-            vec![top[0], top[1], bot[0], bot[1]]
+            let rows = Layout::vertical([Min(1), Length(1), Min(1)]).split(inner);
+            let top = Layout::horizontal([Min(1), Length(1), Min(1)]).split(rows[0]);
+            let bot = Layout::horizontal([Min(1), Length(1), Min(1)]).split(rows[2]);
+            (
+                vec![top[0], top[2], bot[0], bot[2]],
+                vec![(rows[1], true), (top[1], false), (bot[1], false)],
+            )
         }
+    }
+}
+
+fn render_divider(f: &mut Frame, rect: Rect, horizontal: bool) {
+    let st = Style::default().fg(t::GUTTER);
+    if horizontal {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled("─".repeat(rect.width as usize), st))),
+            rect,
+        );
+    } else {
+        let lines: Vec<Line> = (0..rect.height)
+            .map(|_| Line::from(Span::styled("│", st)))
+            .collect();
+        f.render_widget(Paragraph::new(lines), rect);
     }
 }
 
 fn render_active_space(f: &mut Frame, region: Rect, app: &mut App) {
     let si = app.active_space;
-    let header = {
+    let (n, zoom, dir) = {
         let sp = &app.spaces[si];
-        let n = sp.chats.len();
-        let count = if n > 1 { format!("  ({n} chats)") } else { String::new() };
+        (sp.chats.len(), sp.zoom, sp.split_dir)
+    };
+    let title = {
+        let sp = &app.spaces[si];
+        let count = if n > 1 { format!(" ({n}) ") } else { " ".to_string() };
         Line::from(vec![
-            Span::styled(" ▍", Style::default().fg(t::PURPLE)),
             Span::styled(
-                space_name(sp),
+                format!(" {}", space_name(sp)),
                 Style::default().fg(t::PURPLE).add_modifier(Modifier::BOLD),
             ),
             Span::styled(count, Style::default().fg(t::DIM)),
         ])
     };
-    let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(region);
-    f.render_widget(Paragraph::new(header), rows[0]);
+    let focused_main = app.focus == Focus::Main;
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(if focused_main { t::PURPLE } else { t::GUTTER }))
+        .title(title);
+    let inner = block.inner(region);
+    f.render_widget(block, region);
 
-    // even margins around the panes
-    let body = Rect {
-        x: rows[1].x + 1,
-        y: rows[1].y,
-        width: rows[1].width.saturating_sub(2),
-        height: rows[1].height,
-    };
-    let n = app.spaces[si].chats.len();
-    let (zoom, focused, dir) = {
-        let sp = &app.spaces[si];
-        (sp.zoom, sp.fi(), sp.split_dir)
-    };
-    if zoom {
-        render_chat_pane(f, body, app, si, focused);
+    if zoom || n == 1 {
+        let ci = app.spaces[si].fi();
+        render_chat_body(f, inner, app, si, ci, n > 1);
         return;
     }
-    let rects = pane_rects(body, n, dir);
+    let (panes, dividers) = space_layout(inner, n, dir);
+    for (drect, horiz) in dividers {
+        render_divider(f, drect, horiz);
+    }
     for ci in 0..n {
-        if let Some(r) = rects.get(ci).copied() {
-            render_chat_pane(f, r, app, si, ci);
+        if let Some(r) = panes.get(ci).copied() {
+            render_chat_body(f, r, app, si, ci, true);
         }
     }
 }
 
-fn render_chat_pane(f: &mut Frame, rect: Rect, app: &mut App, si: usize, ci: usize) {
-    let (name, inflight, is_focus) = {
-        let sp = &app.spaces[si];
-        let c = &sp.chats[ci];
-        (chat_title(c), c.in_flight, app.focus == Focus::Main && ci == sp.fi())
-    };
-    let border_col = if is_focus { t::PURPLE } else { t::GUTTER };
-    let dot_col = if inflight {
-        t::AMBER
-    } else if is_focus {
-        t::PURPLE
+fn render_chat_body(f: &mut Frame, rect: Rect, app: &mut App, si: usize, ci: usize, header: bool) {
+    let is_focus = app.focus == Focus::Main && ci == app.spaces[si].fi();
+    let body = if header {
+        let (name, inflight) = {
+            let c = &app.spaces[si].chats[ci];
+            (chat_title(c), c.in_flight)
+        };
+        let dot_col = if inflight {
+            t::AMBER
+        } else if is_focus {
+            t::PURPLE
+        } else {
+            t::DIM
+        };
+        let glyph = if inflight {
+            SPIN[app.spinner % SPIN.len()]
+        } else {
+            "●"
+        };
+        let marker = if is_focus { "▸" } else { " " };
+        let hdr = Line::from(vec![
+            Span::styled(format!("{marker} {glyph} "), Style::default().fg(dot_col)),
+            Span::styled(
+                name,
+                if is_focus {
+                    Style::default().fg(t::FG).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(t::DIM)
+                },
+            ),
+        ]);
+        let parts = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(rect);
+        f.render_widget(Paragraph::new(hdr), parts[0]);
+        parts[1]
     } else {
-        t::DIM
+        rect
     };
-    let glyph = if inflight {
-        SPIN[app.spinner % SPIN.len()]
-    } else {
-        "●"
-    };
-    let title = Line::from(vec![
-        Span::styled(format!(" {glyph} "), Style::default().fg(dot_col)),
-        Span::styled(
-            name,
-            if is_focus {
-                Style::default().fg(t::FG).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(t::DIM)
-            },
-        ),
-        Span::raw(" "),
-    ]);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(border_col))
-        .title(title);
-    let inner = block.inner(rect);
-    f.render_widget(block, rect);
 
     let spin = app.spinner;
     let lines = build_lines(&app.spaces[si].chats[ci], spin);
     let total = lines.len();
-    let h = inner.height as usize;
+    let h = body.height as usize;
     let max_scroll = total.saturating_sub(h);
     app.spaces[si].chats[ci].last_max_scroll = max_scroll as u16;
     let chat = &app.spaces[si].chats[ci];
@@ -253,7 +281,7 @@ fn render_chat_pane(f: &mut Frame, rect: Rect, app: &mut App, si: usize, ci: usi
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .scroll((scroll as u16, 0)),
-        inner,
+        body,
     );
 }
 
@@ -535,10 +563,9 @@ fn render_whichkey(f: &mut Frame, area: Rect, pending: Pending) {
         Pending::LeaderT => (
             "leader t",
             vec![
+                ("n", "new chat (tab) in space"),
                 ("o", "new space"),
                 ("x", "close pane"),
-                ("n", "next pane"),
-                ("p", "prev pane"),
             ],
         ),
         Pending::LeaderZ => ("leader z", vec![("z", "help / all keybinds")]),
