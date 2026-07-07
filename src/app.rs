@@ -169,7 +169,11 @@ pub fn chat_title(c: &Chat) -> String {
 
 /// Display name for a space: its name, else (single chat) the chat's title.
 pub fn space_name(sp: &Space) -> String {
-    if !sp.name.trim().is_empty() {
+    // A single-chat space's name IS its chat's name (renaming the chat renames
+    // the entry). Multi-chat spaces use their own name.
+    if sp.chats.len() == 1 {
+        chat_title(&sp.chats[0])
+    } else if !sp.name.trim().is_empty() {
         sp.name.clone()
     } else {
         sp.chats
@@ -566,12 +570,42 @@ impl App {
     }
 
     fn key_normal(&mut self, k: KeyEvent, ctrl: bool) {
+        if self.spaces.is_empty() {
+            match k.code {
+                KeyCode::Char('n') | KeyCode::Char('i') => {
+                    self.new_space();
+                    self.mode = Mode::Insert;
+                }
+                KeyCode::Char('a') => self.new_named_space(),
+                KeyCode::Char('e') => self.sidebar_open = !self.sidebar_open,
+                KeyCode::Char(':') => {
+                    self.cmd.clear();
+                    self.mode = Mode::Command;
+                }
+                KeyCode::Char('q') => self.should_quit = true,
+                KeyCode::Char('c') if ctrl => self.should_quit = true,
+                _ => {}
+            }
+            return;
+        }
         match k.code {
             KeyCode::Char('c') if ctrl => self.should_quit = true,
             KeyCode::Char('h') if ctrl => self.focus_dir(Dir::Left),
             KeyCode::Char('l') if ctrl => self.focus_dir(Dir::Right),
-            KeyCode::Char('j') if ctrl => self.focus_dir(Dir::Down),
-            KeyCode::Char('k') if ctrl => self.focus_dir(Dir::Up),
+            KeyCode::Char('j') if ctrl => {
+                if self.focus == Focus::Sidebar {
+                    self.sidebar_move(1)
+                } else {
+                    self.focus_dir(Dir::Down)
+                }
+            }
+            KeyCode::Char('k') if ctrl => {
+                if self.focus == Focus::Sidebar {
+                    self.sidebar_move(-1)
+                } else {
+                    self.focus_dir(Dir::Up)
+                }
+            }
             KeyCode::Char('e') if ctrl => self.focus_sidebar(),
             KeyCode::Char('d') if ctrl => self.scroll_down(8),
             KeyCode::Char('u') if ctrl => self.scroll_up(8),
@@ -895,7 +929,6 @@ impl App {
             sp.zoom = false;
         }
         self.focus = Focus::Main;
-        self.mode = Mode::Insert;
         self.persist();
     }
 
@@ -940,10 +973,15 @@ impl App {
     }
 
     fn delete_space_at(&mut self, i: usize) {
-        if self.spaces.len() <= 1 || i >= self.spaces.len() {
+        if i >= self.spaces.len() {
             return;
         }
         self.spaces.remove(i);
+        if self.spaces.is_empty() {
+            self.active_space = 0;
+            self.sidebar_cursor = 0;
+            return; // empty — "start a space" state
+        }
         if self.active_space >= self.spaces.len() {
             self.active_space = self.spaces.len() - 1;
         }
@@ -1076,7 +1114,16 @@ impl App {
         match self.rename_target {
             RenameTarget::Space => {
                 let idx = self.sidebar_cursor.min(self.spaces.len().saturating_sub(1));
-                self.spaces[idx].name = self.rename_buf.trim().to_string();
+                let name = self.rename_buf.trim().to_string();
+                if self.spaces[idx].chats.len() == 1 {
+                    // single-chat space: renaming the entry renames the chat
+                    if !name.is_empty() {
+                        self.spaces[idx].chats[0].title = name;
+                        self.spaces[idx].chats[0].autonamed = true;
+                    }
+                } else {
+                    self.spaces[idx].name = name;
+                }
             }
             RenameTarget::Chat => {
                 let ai = self.active_space;
@@ -1150,16 +1197,29 @@ impl App {
         self.cmd.clear();
         self.mode = Mode::Normal;
         match cmd.as_str() {
-            "q" | "quit" => self.should_quit = true,
+            "q" | "quit" => {
+                self.should_quit = true;
+                return;
+            }
             "new" => {
                 self.new_space();
                 self.mode = Mode::Insert;
+                return;
             }
+            "w" | "ws" | "write" => {
+                self.persist();
+                return;
+            }
+            _ => {}
+        }
+        if self.spaces.is_empty() {
+            return;
+        }
+        match cmd.as_str() {
             "close" => self.close_focused_pane(),
             "pop" => self.pop_chat(),
             "vsplit" | "vs" => self.spaces[self.active_space].split_dir = SplitDir::V,
             "split" | "sp" => self.spaces[self.active_space].split_dir = SplitDir::H,
-            "w" | "ws" | "write" => self.persist(),
             _ => {}
         }
     }
@@ -1233,7 +1293,7 @@ Working directory: {cwd}. You're in a terminal on macOS (tmux/Ghostty) — keep 
 
     fn send_prompt(&mut self) {
         let prompt = self.input.trim().to_string();
-        if prompt.is_empty() {
+        if prompt.is_empty() || self.spaces.is_empty() {
             return;
         }
         let ai = self.active_space;
@@ -1255,6 +1315,9 @@ Working directory: {cwd}. You're in a terminal on macOS (tmux/Ghostty) — keep 
     /// A message arrived over the pipe from another agent — deliver it to the
     /// named space's focused chat and let that agent respond (shown in the UI).
     fn inject_pipe(&mut self, to: String, from: String, message: String) {
+        if self.spaces.is_empty() {
+            return;
+        }
         let target = self
             .spaces
             .iter()

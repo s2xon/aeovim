@@ -38,6 +38,13 @@ pub fn render(f: &mut Frame, app: &mut App) {
     if app.sidebar_open && side_w > 0 {
         render_sidebar(f, cols[0], app);
     }
+    if app.spaces.is_empty() {
+        render_empty(f, cols[1]);
+        if app.help_open {
+            render_help(f, area);
+        }
+        return;
+    }
     let rows = Layout::vertical([
         Constraint::Min(3),
         Constraint::Length(1), // lualine status
@@ -133,8 +140,42 @@ fn render_sidebar(f: &mut Frame, area: Rect, app: &App) {
             "  no spaces",
             Style::default().fg(t::DIM),
         )));
+        lines.push(Line::from(Span::styled(
+            "  press n to start",
+            Style::default().fg(t::PERI),
+        )));
     }
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+fn render_empty(f: &mut Frame, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(t::GUTTER));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let mid = inner.height / 2;
+    let lines: Vec<Line> = (0..inner.height)
+        .map(|r| {
+            if r == mid {
+                Line::from(Span::styled(
+                    "start a space  —  press  n",
+                    Style::default().fg(t::PERI).add_modifier(Modifier::BOLD),
+                ))
+                .centered()
+            } else if r == mid + 1 {
+                Line::from(Span::styled(
+                    "you have no open spaces",
+                    Style::default().fg(t::DIM),
+                ))
+                .centered()
+            } else {
+                Line::from("")
+            }
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 // Chats inside a space are split by a single thin divider — not boxed.
@@ -173,19 +214,16 @@ fn space_layout(inner: Rect, n: usize, dir: SplitDir) -> (Vec<Rect>, Vec<(Rect, 
     }
 }
 
-fn render_divider(f: &mut Frame, rect: Rect, horizontal: bool) {
-    let st = Style::default().fg(t::GUTTER);
-    if horizontal {
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled("─".repeat(rect.width as usize), st))),
-            rect,
-        );
-    } else {
-        let lines: Vec<Line> = (0..rect.height)
-            .map(|_| Line::from(Span::styled("│", st)))
-            .collect();
-        f.render_widget(Paragraph::new(lines), rect);
-    }
+fn put_char(f: &mut Frame, x: u16, y: u16, ch: &str, st: Style) {
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(ch.to_string(), st))),
+        Rect {
+            x,
+            y,
+            width: 1,
+            height: 1,
+        },
+    );
 }
 
 fn render_active_space(f: &mut Frame, region: Rect, app: &mut App) {
@@ -220,8 +258,35 @@ fn render_active_space(f: &mut Frame, region: Rect, app: &mut App) {
         return;
     }
     let (panes, dividers) = space_layout(inner, n, dir);
-    for (drect, horiz) in dividers {
-        render_divider(f, drect, horiz);
+    let dstyle = Style::default().fg(t::GUTTER);
+    for (drect, _) in dividers.iter().filter(|(_, h)| *h) {
+        // horizontal divider — join the side borders with ├ … ┤
+        let w = region.width as usize;
+        let mut line = String::from("├");
+        for _ in 0..w.saturating_sub(2) {
+            line.push('─');
+        }
+        if w >= 2 {
+            line.push('┤');
+        }
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(line, dstyle))),
+            Rect {
+                x: region.x,
+                y: drect.y,
+                width: region.width,
+                height: 1,
+            },
+        );
+    }
+    for (drect, _) in dividers.iter().filter(|(_, h)| !*h) {
+        // vertical divider — join top/bottom with ┬ … ┴
+        let lines: Vec<Line> = (0..drect.height)
+            .map(|_| Line::from(Span::styled("│", dstyle)))
+            .collect();
+        f.render_widget(Paragraph::new(lines), *drect);
+        put_char(f, drect.x, drect.y.saturating_sub(1), "┬", dstyle);
+        put_char(f, drect.x, drect.y + drect.height, "┴", dstyle);
     }
     for ci in 0..n {
         if let Some(r) = panes.get(ci).copied() {
