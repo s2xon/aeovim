@@ -409,7 +409,7 @@ fn build_lines(chat: &Chat, spin: usize) -> Vec<Line<'static>> {
         }
         out.push(Line::from(Span::styled("claude", asst_lbl)));
         out.push(Line::from(Span::styled(
-            format!("  {} …", SPIN[spin % SPIN.len()]),
+            format!("  {}", SPIN[spin % SPIN.len()]),
             note_st,
         )));
     }
