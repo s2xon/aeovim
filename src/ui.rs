@@ -460,19 +460,8 @@ fn render_status(f: &mut Frame, area: Rect, app: &App) {
 
 fn render_picker(f: &mut Frame, area: Rect, app: &App) {
     let cands = app.picker_candidates();
-    // rows = matches, then a trailing "＋ new chat"
-    let mut rows: Vec<(String, bool)> = cands
-        .iter()
-        .map(|&ci| (title_of(&app.chats[ci]), false))
-        .collect();
-    let new_label = if app.picker_query.trim().is_empty() {
-        "＋ new chat".to_string()
-    } else {
-        format!("＋ new: {}", app.picker_query.trim())
-    };
-    rows.push((new_label, true));
-
-    let vis = rows.len().clamp(1, 12);
+    let q = app.picker_query.trim();
+    let vis = cands.len().clamp(1, 12);
     let w = 54u16.min(area.width.saturating_sub(4));
     let h = ((vis as u16) + 3).min(area.height.saturating_sub(2)).max(4);
     let rect = centered(area, w, h);
@@ -499,17 +488,30 @@ fn render_picker(f: &mut Frame, area: Rect, app: &App) {
         0
     };
     let mut lines: Vec<Line> = Vec::new();
-    for (idx, (label, is_new)) in rows.iter().enumerate().skip(start).take(win) {
-        let selected = idx == app.picker_sel;
-        let caret = if selected { "› " } else { "  " };
-        let st = if selected {
-            Style::default().fg(t::PINK).add_modifier(Modifier::BOLD)
-        } else if *is_new {
-            Style::default().fg(t::PERI)
+    if cands.is_empty() {
+        let hint = if q.is_empty() {
+            "  type to find — or a new name to create".to_string()
         } else {
-            Style::default().fg(t::FG)
+            format!("  ↵ create \"{q}\"")
         };
-        lines.push(Line::from(Span::styled(format!("{caret}{label}"), st)));
+        lines.push(Line::from(Span::styled(hint, Style::default().fg(t::PERI))));
+    } else {
+        for (row, &ci) in cands.iter().enumerate().skip(start).take(win) {
+            let c = &app.chats[ci];
+            let selected = row == app.picker_sel;
+            let caret = if selected { "› " } else { "  " };
+            let st = if selected {
+                Style::default().fg(t::PINK).add_modifier(Modifier::BOLD)
+            } else if c.in_flight {
+                Style::default().fg(t::AMBER)
+            } else {
+                Style::default().fg(t::FG)
+            };
+            lines.push(Line::from(Span::styled(
+                format!("{caret}{}", title_of(c)),
+                st,
+            )));
+        }
     }
     f.render_widget(Paragraph::new(lines), results_area);
 
@@ -557,7 +559,7 @@ fn render_whichkey(f: &mut Frame, area: Rect, pending: Pending) {
                 ("s", "+spaces (split / find)"),
                 ("t", "+tab"),
                 ("a", "add + name chat"),
-                ("0-9", "jump to chat N"),
+                ("1-0", "focus space N"),
             ],
         ),
         Pending::LeaderS => (
@@ -649,7 +651,7 @@ fn render_help(f: &mut Frame, area: Rect) {
         ("r", "rename chat"),
         ("s", "select / deselect (multi-select)"),
         ("d", "delete chat(s) — asks to confirm"),
-        ("Space 0-9", "jump to chat N in current group"),
+        ("Space 1-0", "focus space N (pane)"),
         ("", "SCROLL"),
         ("Ctrl-d / Ctrl-u", "half page  ·  gg / G  top / bottom"),
         ("", "MISC"),

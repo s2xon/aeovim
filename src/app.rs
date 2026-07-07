@@ -329,14 +329,6 @@ impl App {
         order
     }
 
-    fn category_indices(&self) -> Vec<usize> {
-        let q = self.cur_chat().qualifier.clone();
-        self.visible_order()
-            .into_iter()
-            .filter(|&i| self.chats[i].qualifier == q)
-            .collect()
-    }
-
     fn sidebar_to(&mut self, id: u64) {
         let order = self.visible_order();
         if let Some(pos) = order.iter().position(|&i| self.chats[i].id == id) {
@@ -528,9 +520,10 @@ impl App {
     }
 
     fn picker_down(&mut self) {
-        // rows = matches + a trailing "+ new chat", so max index == len
         let n = self.picker_candidates().len();
-        self.picker_sel = (self.picker_sel + 1).min(n);
+        if n > 0 {
+            self.picker_sel = (self.picker_sel + 1).min(n - 1);
+        }
     }
     fn picker_up(&mut self) {
         self.picker_sel = self.picker_sel.saturating_sub(1);
@@ -647,12 +640,10 @@ impl App {
                     KeyCode::Char('v') => {
                         self.split(SplitDir::V);
                         self.open_picker(PickerAction::OpenHere);
-                        self.picker_sel = self.picker_candidates().len(); // default: + new chat
                     }
                     KeyCode::Char('h') => {
                         self.split(SplitDir::H);
                         self.open_picker(PickerAction::OpenHere);
-                        self.picker_sel = self.picker_candidates().len();
                     }
                     KeyCode::Char('c') => self.open_picker(PickerAction::AddTab),
                     KeyCode::Char('x') => self.close_pane(),
@@ -916,19 +907,22 @@ impl App {
 
     fn picker_commit(&mut self) {
         let cands = self.picker_candidates();
-        let id = if self.picker_sel >= cands.len() {
-            // the trailing "+ new chat" entry — create a brand-new chat
-            let id = self.add_chat_to_list();
+        let id = if let Some(&ci) = cands.get(self.picker_sel) {
+            // a match is highlighted — use it
+            Some(self.chats[ci].id)
+        } else {
+            // nothing matches the query → auto-create a new chat with that name
             let q = self.picker_query.trim().to_string();
-            if !q.is_empty() {
+            if q.is_empty() {
+                None
+            } else {
+                let id = self.add_chat_to_list();
                 if let Some(i) = self.chat_index(id) {
                     self.chats[i].title = slug(&q);
                     self.chats[i].autonamed = true;
                 }
+                Some(id)
             }
-            Some(id)
-        } else {
-            cands.get(self.picker_sel).map(|&ci| self.chats[ci].id)
         };
         if let Some(id) = id {
             match self.picker_action {
@@ -952,13 +946,12 @@ impl App {
         self.sidebar_cursor = next;
     }
 
+    /// Leader + 1..9,0 → focus space (pane) 0..9.
     fn leader_jump(&mut self, d: char) {
-        let idx = (d as u8 - b'0') as usize;
-        let cat = self.category_indices();
-        if let Some(&ci) = cat.get(idx) {
-            let id = self.chats[ci].id;
-            self.pane_open(id);
-            self.sidebar_to(id);
+        let idx = if d == '0' { 9 } else { (d as u8 - b'1') as usize };
+        if idx < self.panes.len() {
+            self.active_pane = idx;
+            self.focus = Focus::Main;
         }
     }
 
