@@ -748,11 +748,17 @@ impl App {
                 }
             }
             KeyCode::Left => self.focus_dir(Dir::Left),
-            KeyCode::Right | KeyCode::Enter => {
+            KeyCode::Right => {
                 if self.focus == Focus::Sidebar {
                     self.activate_selected()
                 } else {
                     self.focus_dir(Dir::Right)
+                }
+            }
+            KeyCode::Enter => {
+                // Enter only activates a space from the sidebar; no-op in a pane
+                if self.focus == Focus::Sidebar {
+                    self.activate_selected()
                 }
             }
             KeyCode::Tab => self.pane_cycle(1),
@@ -836,7 +842,9 @@ impl App {
                 self.pending = Pending::None;
                 match k.code {
                     KeyCode::Char('c') => self.add_chat_to_active(),
-                    KeyCode::Char('s') => self.new_space(),
+                    KeyCode::Char('s') => {
+                        self.new_space();
+                    }
                     _ => {}
                 }
             }
