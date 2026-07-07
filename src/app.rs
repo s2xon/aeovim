@@ -30,7 +30,6 @@ pub enum Pending {
     None,
     G,
     Leader,
-    LeaderE,
     LeaderS,
     LeaderT,
     LeaderZ,
@@ -449,7 +448,7 @@ impl App {
                             self.scroll_up(1)
                         }
                     }
-                    KeyCode::Char('h') | KeyCode::Left => {
+                    KeyCode::Left => {
                         if self.focus == Focus::Main {
                             self.focus_sidebar()
                         }
@@ -483,12 +482,11 @@ impl App {
                 }
             }
             Pending::Leader => match k.code {
-                KeyCode::Char('b') => {
+                KeyCode::Char('e') => {
                     self.pending = Pending::None;
                     self.toggle_sidebar();
                 }
                 KeyCode::Char('z') => self.pending = Pending::LeaderZ,
-                KeyCode::Char('e') => self.pending = Pending::LeaderE,
                 KeyCode::Char('s') => self.pending = Pending::LeaderS,
                 KeyCode::Char('t') => self.pending = Pending::LeaderT,
                 KeyCode::Char('a') => {
@@ -501,24 +499,6 @@ impl App {
                 }
                 _ => self.pending = Pending::None,
             },
-            Pending::LeaderE => {
-                self.pending = Pending::None;
-                match k.code {
-                    KeyCode::Char('e') => {
-                        self.sidebar_open = !self.sidebar_open;
-                        if !self.sidebar_open {
-                            self.focus = Focus::Main;
-                        }
-                    }
-                    KeyCode::Char('f') => self.focus_sidebar(),
-                    KeyCode::Char('c') => {
-                        self.sidebar_open = false;
-                        self.focus = Focus::Main;
-                    }
-                    KeyCode::Char('r') => self.persist(),
-                    _ => {}
-                }
-            }
             Pending::LeaderS => {
                 self.pending = Pending::None;
                 self.active_chat_mut().transcript.push(Entry::Note(
@@ -623,14 +603,13 @@ impl App {
         self.mode = Mode::Rename;
     }
 
-    /// Space b: toggle the sidebar and move focus with it.
+    /// Space e: toggle sidebar visibility. Focus is handled by Ctrl-h / Ctrl-l.
     fn toggle_sidebar(&mut self) {
         self.sidebar_open = !self.sidebar_open;
-        if self.sidebar_open {
-            self.focus = Focus::Sidebar;
-            self.sync_cursor();
-        } else {
+        if !self.sidebar_open && self.focus == Focus::Sidebar {
             self.focus = Focus::Main;
+        } else if self.sidebar_open {
+            self.sync_cursor();
         }
     }
 
