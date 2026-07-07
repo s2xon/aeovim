@@ -1,0 +1,117 @@
+//! Parsing of the `claude` CLI headless `stream-json` (NDJSON) event stream.
+//!
+//! v1 is deliberately lenient: every line is parsed as a `serde_json::Value` and
+//! matched on the top-level `type` (then `subtype`). Unknown shapes map to
+//! `Ignore` rather than crashing — the "keep going on unrecognized events"
+//! principle from the design (DESIGN.md §5.3). Typed structs with exact
+//! `#[serde(rename)]` fields are a later hardening step.
+
+use serde_json::Value;
+
+/// A backend-agnostic event distilled from one claude stream-json line.
+#[derive(Debug, Clone)]
+pub enum AgentEvent {
+    /// `system/init` — the session announced its id + model (+ capabilities, later).
+    Init {
+        session_id: Option<String>,
+        model: Option<String>,
+    },
+    /// A token-level text delta (`content_block_delta` / `text_delta`).
+    TextDelta(String),
+    /// A complete assistant text message (authoritative; replaces streamed text).
+    AssistantFinal(String),
+    /// The agent invoked a tool (skeleton just surfaces the name).
+    ToolUse(String),
+    /// The turn finished. Carries cost + final text as a fallback.
+    TurnResult {
+        cost_usd: f64,
+        is_error: bool,
+        text: Option<String>,
+    },
+    /// Nothing to render.
+    Ignore,
+}
+
+/// Parse a single NDJSON line into an [`AgentEvent`].
+pub fn parse_line(line: &str) -> AgentEvent {
+    let line = line.trim();
+    if line.is_empty() {
+        return AgentEvent::Ignore;
+    }
+    let v: Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(_) => return AgentEvent::Ignore,
+    };
+
+    match v.get("type").and_then(Value::as_str).unwrap_or("") {
+        "system" => {
+            if v.get("subtype").and_then(Value::as_str) == Some("init") {
+                AgentEvent::Init {
+                    session_id: v.get("session_id").and_then(Value::as_str).map(String::from),
+                    model: v.get("model").and_then(Value::as_str).map(String::from),
+                }
+            } else {
+                // hook_started / hook_response / status — quiet in the skeleton.
+                AgentEvent::Ignore
+            }
+        }
+
+        // Token-level streaming (only present with --include-partial-messages).
+        "stream_event" => {
+            let ev = v.get("event");
+            let etype = ev
+                .and_then(|e| e.get("type"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if etype == "content_block_delta" {
+                let delta = ev.and_then(|e| e.get("delta"));
+                if delta.and_then(|d| d.get("type")).and_then(Value::as_str) == Some("text_delta") {
+                    if let Some(t) = delta.and_then(|d| d.get("text")).and_then(Value::as_str) {
+                        return AgentEvent::TextDelta(t.to_string());
+                    }
+                }
+            }
+            AgentEvent::Ignore
+        }
+
+        // A full assistant message: concat text blocks, else surface a tool_use.
+        "assistant" => {
+            let content = v
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(Value::as_array);
+            if let Some(arr) = content {
+                let mut text = String::new();
+                let mut tool: Option<String> = None;
+                for block in arr {
+                    match block.get("type").and_then(Value::as_str) {
+                        Some("text") => {
+                            if let Some(t) = block.get("text").and_then(Value::as_str) {
+                                text.push_str(t);
+                            }
+                        }
+                        Some("tool_use") => {
+                            tool = block.get("name").and_then(Value::as_str).map(String::from);
+                        }
+                        _ => {}
+                    }
+                }
+                if !text.trim().is_empty() {
+                    return AgentEvent::AssistantFinal(text);
+                }
+                if let Some(name) = tool {
+                    return AgentEvent::ToolUse(name);
+                }
+            }
+            AgentEvent::Ignore
+        }
+
+        "result" => AgentEvent::TurnResult {
+            cost_usd: v.get("total_cost_usd").and_then(Value::as_f64).unwrap_or(0.0),
+            is_error: v.get("is_error").and_then(Value::as_bool).unwrap_or(false),
+            text: v.get("result").and_then(Value::as_str).map(String::from),
+        },
+
+        _ => AgentEvent::Ignore,
+    }
+}
