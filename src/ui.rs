@@ -47,13 +47,13 @@ pub fn render(f: &mut Frame, app: &mut App) {
     }
     let rows = Layout::vertical([
         Constraint::Min(3),
-        Constraint::Length(3),
-        Constraint::Length(1),
+        Constraint::Length(1), // status (lualine) above the prompt
+        Constraint::Length(3), // prompt — flush with the bottom
     ])
     .split(cols[1]);
     render_spaces(f, rows[0], app);
-    render_composer(f, rows[1], app);
-    render_status(f, rows[2], app);
+    render_status(f, rows[1], app);
+    render_composer(f, rows[2], app);
 
     if app.help_open {
         render_help(f, area);
