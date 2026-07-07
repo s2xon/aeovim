@@ -21,6 +21,7 @@ pub enum Mode {
     Command,
     Rename,
     Picker,
+    Confirm,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -176,6 +177,9 @@ pub struct App {
     pub input: String,
     pub cmd: String,
     pub rename_buf: String,
+    selected: Vec<u64>,
+    pending_delete: Vec<u64>,
+    pub confirm_msg: String,
     pub picker_query: String,
     pub picker_sel: usize,
     picker_action: PickerAction,
@@ -225,6 +229,9 @@ impl App {
             input: String::new(),
             cmd: String::new(),
             rename_buf: String::new(),
+            selected: Vec::new(),
+            pending_delete: Vec::new(),
+            confirm_msg: String::new(),
             picker_query: String::new(),
             picker_sel: 0,
             picker_action: PickerAction::AddTab,
@@ -277,6 +284,9 @@ impl App {
     }
     pub fn is_open(&self, id: u64) -> bool {
         self.panes.iter().any(|p| p.tabs.contains(&id))
+    }
+    pub fn is_selected(&self, id: u64) -> bool {
+        self.selected.contains(&id)
     }
 
     pub fn persist(&self) {
@@ -436,6 +446,7 @@ impl App {
             Mode::Rename => self.key_rename(k, ctrl),
             Mode::Insert => self.key_insert(k, ctrl),
             Mode::Picker => self.key_picker(k, ctrl),
+            Mode::Confirm => self.key_confirm(k),
             Mode::Normal => {
                 if self.pending != Pending::None {
                     self.handle_pending(k);
@@ -517,10 +528,9 @@ impl App {
     }
 
     fn picker_down(&mut self) {
+        // rows = matches + a trailing "+ new chat", so max index == len
         let n = self.picker_candidates().len();
-        if n > 0 {
-            self.picker_sel = (self.picker_sel + 1).min(n - 1);
-        }
+        self.picker_sel = (self.picker_sel + 1).min(n);
     }
     fn picker_up(&mut self) {
         self.picker_sel = self.picker_sel.saturating_sub(1);
@@ -554,9 +564,20 @@ impl App {
             KeyCode::Char('n') => self.new_chat(),
             KeyCode::Char('a') if self.focus == Focus::Sidebar => self.new_named_chat(),
             KeyCode::Char('r') => self.rename_start(),
-            KeyCode::Char('d') if self.focus == Focus::Sidebar => {
-                if let Some(id) = self.sel_id() {
-                    self.delete_chat(id);
+            KeyCode::Char('s') if self.focus == Focus::Sidebar => self.toggle_select(),
+            KeyCode::Char('d') if self.focus == Focus::Sidebar => self.request_delete(),
+            KeyCode::Char('}') => {
+                if self.focus == Focus::Sidebar {
+                    self.sidebar_group_jump(1)
+                } else {
+                    self.scroll_down(10)
+                }
+            }
+            KeyCode::Char('{') => {
+                if self.focus == Focus::Sidebar {
+                    self.sidebar_group_jump(-1)
+                } else {
+                    self.scroll_up(10)
                 }
             }
             KeyCode::Char('j') | KeyCode::Down => {
@@ -626,10 +647,12 @@ impl App {
                     KeyCode::Char('v') => {
                         self.split(SplitDir::V);
                         self.open_picker(PickerAction::OpenHere);
+                        self.picker_sel = self.picker_candidates().len(); // default: + new chat
                     }
                     KeyCode::Char('h') => {
                         self.split(SplitDir::H);
                         self.open_picker(PickerAction::OpenHere);
+                        self.picker_sel = self.picker_candidates().len();
                     }
                     KeyCode::Char('c') => self.open_picker(PickerAction::AddTab),
                     KeyCode::Char('x') => self.close_pane(),
@@ -893,8 +916,21 @@ impl App {
 
     fn picker_commit(&mut self) {
         let cands = self.picker_candidates();
-        if let Some(&ci) = cands.get(self.picker_sel) {
-            let id = self.chats[ci].id;
+        let id = if self.picker_sel >= cands.len() {
+            // the trailing "+ new chat" entry — create a brand-new chat
+            let id = self.add_chat_to_list();
+            let q = self.picker_query.trim().to_string();
+            if !q.is_empty() {
+                if let Some(i) = self.chat_index(id) {
+                    self.chats[i].title = slug(&q);
+                    self.chats[i].autonamed = true;
+                }
+            }
+            Some(id)
+        } else {
+            cands.get(self.picker_sel).map(|&ci| self.chats[ci].id)
+        };
+        if let Some(id) = id {
             match self.picker_action {
                 PickerAction::AddTab => self.pane_add_tab(id),
                 PickerAction::OpenHere => self.pane_open(id),
@@ -956,7 +992,7 @@ impl App {
 
     fn new_chat(&mut self) {
         let id = self.add_chat_to_list();
-        self.pane_open(id);
+        self.pane_add_tab(id); // add as a NEW tab in this space (own fresh session)
         self.focus = Focus::Main;
         self.mode = Mode::Insert;
     }
@@ -1053,6 +1089,101 @@ impl App {
             self.sidebar_cursor = order.len().saturating_sub(1);
         }
         self.persist();
+    }
+
+    fn toggle_select(&mut self) {
+        if let Some(id) = self.sel_id() {
+            if let Some(pos) = self.selected.iter().position(|&x| x == id) {
+                self.selected.remove(pos);
+            } else {
+                self.selected.push(id);
+            }
+        }
+    }
+
+    /// Ask before deleting: the multi-selected chats, else the one under the cursor.
+    fn request_delete(&mut self) {
+        let ids: Vec<u64> = if !self.selected.is_empty() {
+            self.selected.clone()
+        } else if let Some(id) = self.sel_id() {
+            vec![id]
+        } else {
+            return;
+        };
+        let n = ids.len();
+        self.confirm_msg = if n == 1 {
+            let name = self
+                .chat_index(ids[0])
+                .map(|i| {
+                    let c = &self.chats[i];
+                    if c.title.trim().is_empty() {
+                        "untitled".to_string()
+                    } else {
+                        c.title.clone()
+                    }
+                })
+                .unwrap_or_default();
+            format!("delete chat \"{name}\"?   y / n")
+        } else {
+            format!("delete {n} chats?   y / n")
+        };
+        self.pending_delete = ids;
+        self.mode = Mode::Confirm;
+    }
+
+    fn key_confirm(&mut self, k: KeyEvent) {
+        match k.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                let ids = std::mem::take(&mut self.pending_delete);
+                for id in ids {
+                    self.delete_chat(id);
+                }
+                self.selected.clear();
+                self.mode = Mode::Normal;
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.pending_delete.clear();
+                self.mode = Mode::Normal;
+            }
+            _ => {}
+        }
+    }
+
+    /// Vim `{` / `}` over the sidebar: jump to the first item of the prev / next
+    /// qualifier group.
+    fn sidebar_group_jump(&mut self, dir: isize) {
+        let order = self.visible_order();
+        if order.is_empty() {
+            return;
+        }
+        let quals: Vec<Option<String>> =
+            order.iter().map(|&i| self.chats[i].qualifier.clone()).collect();
+        let cur = self.sidebar_cursor.min(order.len() - 1);
+        let cur_q = quals[cur].clone();
+        if dir > 0 {
+            let mut j = cur;
+            while j < order.len() && quals[j] == cur_q {
+                j += 1;
+            }
+            self.sidebar_cursor = if j < order.len() { j } else { order.len() - 1 };
+        } else {
+            let mut start = cur;
+            while start > 0 && quals[start - 1] == cur_q {
+                start -= 1;
+            }
+            if start < cur {
+                self.sidebar_cursor = start;
+            } else if start > 0 {
+                let prev_q = quals[start - 1].clone();
+                let mut ps = start - 1;
+                while ps > 0 && quals[ps - 1] == prev_q {
+                    ps -= 1;
+                }
+                self.sidebar_cursor = ps;
+            } else {
+                self.sidebar_cursor = 0;
+            }
+        }
     }
 
     fn set_qualifier(&mut self, q: Option<String>) {
