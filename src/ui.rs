@@ -95,13 +95,7 @@ fn render_sidebar(f: &mut Frame, area: Rect, app: &App) {
             app.mode == Mode::Rename && is_cursor && app.rename_target == RenameTarget::Space;
         let inflight = sp.chats.iter().any(|c| c.in_flight);
 
-        let glyph = if is_selected {
-            "✓"
-        } else if inflight {
-            SPIN[app.spinner % SPIN.len()]
-        } else {
-            "●"
-        };
+        let glyph = if is_selected { "✓" } else { "●" };
         let marker = if is_active {
             "▸"
         } else if is_cursor {
@@ -112,7 +106,7 @@ fn render_sidebar(f: &mut Frame, area: Rect, app: &App) {
         let fg = if is_selected {
             t::PINK
         } else if inflight {
-            t::AMBER
+            if (app.spinner / 4) % 2 == 0 { t::AMBER } else { t::DIM }
         } else if is_active {
             t::FG
         } else {
@@ -309,17 +303,13 @@ fn render_chat_body(f: &mut Frame, rect: Rect, app: &mut App, si: usize, ci: usi
             (chat_title(c), c.in_flight)
         };
         let dot_col = if inflight {
-            t::AMBER
+            if (app.spinner / 4) % 2 == 0 { t::AMBER } else { t::DIM }
         } else if is_focus {
             t::PURPLE
         } else {
             t::DIM
         };
-        let glyph = if inflight {
-            SPIN[app.spinner % SPIN.len()]
-        } else {
-            "●"
-        };
+        let glyph = "●";
         let marker = if is_focus { "▸" } else { " " };
         let hdr = Line::from(vec![
             Span::styled(format!("{marker} {glyph} "), Style::default().fg(dot_col)),
@@ -375,7 +365,26 @@ fn build_lines(chat: &Chat, spin: usize) -> Vec<Line<'static>> {
         match e {
             Entry::User(x) => push_block(&mut out, "you", user_lbl, x, body),
             Entry::Assistant(x) => push_block(&mut out, "claude", asst_lbl, x, body),
-            Entry::Tool(n) => out.push(Line::from(Span::styled(format!("  ⚙ {n}"), tool_st))),
+            Entry::Tool(x) => {
+                for (i, l) in x.split('\n').enumerate() {
+                    let st = if i == 0 {
+                        tool_st.add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(t::DIM)
+                    };
+                    out.push(Line::from(Span::styled(format!("  {l}"), st)));
+                }
+            }
+            Entry::ToolResult { ok, text } => {
+                let col = if *ok { t::GUTTER } else { t::RED };
+                for (i, l) in text.split('\n').enumerate() {
+                    let prefix = if i == 0 { "  ⎿ " } else { "     " };
+                    out.push(Line::from(Span::styled(
+                        format!("{prefix}{l}"),
+                        Style::default().fg(col),
+                    )));
+                }
+            }
             Entry::Note(x) => out.push(Line::from(Span::styled(format!("  {x}"), note_st))),
             Entry::Error(x) => push_block(&mut out, "! error", err_st, x, err_st),
         }
@@ -696,16 +705,16 @@ fn render_status(f: &mut Frame, area: Rect, app: &App) {
     ]);
     f.render_widget(Paragraph::new(left), cols[0]);
 
-    // right: activity
-    let activity = if c.in_flight {
-        format!("{} working ", SPIN[app.spinner % SPIN.len()])
+    // right: activity — flashing dot, not a spinner (the one spinner is in the body)
+    let right = if c.in_flight {
+        let col = if (app.spinner / 4) % 2 == 0 { t::AMBER } else { t::DIM };
+        Line::from(vec![
+            Span::styled("● ", Style::default().fg(col)),
+            Span::styled("working ", Style::default().fg(t::DIM)),
+        ])
     } else {
-        "idle ".to_string()
+        Line::from(Span::styled("idle ", Style::default().fg(t::DIM)))
     };
-    let right = Line::from(Span::styled(
-        activity,
-        Style::default().fg(if c.in_flight { t::AMBER } else { t::DIM }),
-    ));
     f.render_widget(Paragraph::new(right).right_aligned(), cols[1]);
 }
 

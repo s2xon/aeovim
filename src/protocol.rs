@@ -1,47 +1,64 @@
 //! Parsing of the `claude` CLI headless `stream-json` (NDJSON) event stream.
 //!
-//! v1 is deliberately lenient: every line is parsed as a `serde_json::Value` and
-//! matched on the top-level `type` (then `subtype`). Unknown shapes map to
-//! `Ignore` rather than crashing — the "keep going on unrecognized events"
-//! principle from the design (DESIGN.md §5.3). Typed structs with exact
-//! `#[serde(rename)]` fields are a later hardening step.
+//! One line can yield several events (an assistant message may carry text plus
+//! multiple tool_use blocks), so `parse_line` returns a `Vec`. Unknown shapes
+//! yield an empty vec rather than crashing.
 
 use serde_json::Value;
 
-/// A backend-agnostic event distilled from one claude stream-json line.
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
-    /// `system/init` — the session announced its id + model (+ capabilities, later).
     Init {
         session_id: Option<String>,
         model: Option<String>,
         slash_commands: Vec<String>,
     },
-    /// A token-level text delta (`content_block_delta` / `text_delta`).
     TextDelta(String),
-    /// A complete assistant text message (authoritative; replaces streamed text).
     AssistantFinal(String),
-    /// The agent invoked a tool (skeleton just surfaces the name).
-    ToolUse(String),
-    /// The turn finished. Carries cost + final text as a fallback.
+    /// A tool the agent invoked (Edit/Write/Bash/Read/…), with its input.
+    ToolCall {
+        name: String,
+        input: Value,
+    },
+    /// The result of a tool call (stdout, file content, error).
+    ToolResult {
+        ok: bool,
+        text: String,
+    },
     TurnResult {
         cost_usd: f64,
         is_error: bool,
         text: Option<String>,
     },
-    /// Nothing to render.
-    Ignore,
 }
 
-/// Parse a single NDJSON line into an [`AgentEvent`].
-pub fn parse_line(line: &str) -> AgentEvent {
+fn tool_result_text(c: &Value) -> String {
+    if let Some(s) = c.as_str() {
+        return s.to_string();
+    }
+    if let Some(arr) = c.as_array() {
+        let mut s = String::new();
+        for b in arr {
+            if let Some(t) = b.get("text").and_then(Value::as_str) {
+                if !s.is_empty() {
+                    s.push('\n');
+                }
+                s.push_str(t);
+            }
+        }
+        return s;
+    }
+    String::new()
+}
+
+pub fn parse_line(line: &str) -> Vec<AgentEvent> {
     let line = line.trim();
     if line.is_empty() {
-        return AgentEvent::Ignore;
+        return vec![];
     }
     let v: Value = match serde_json::from_str(line) {
         Ok(v) => v,
-        Err(_) => return AgentEvent::Ignore,
+        Err(_) => return vec![],
     };
 
     match v.get("type").and_then(Value::as_str).unwrap_or("") {
@@ -57,18 +74,17 @@ pub fn parse_line(line: &str) -> AgentEvent {
                             .collect()
                     })
                     .unwrap_or_default();
-                AgentEvent::Init {
+                vec![AgentEvent::Init {
                     session_id: v.get("session_id").and_then(Value::as_str).map(String::from),
                     model: v.get("model").and_then(Value::as_str).map(String::from),
                     slash_commands,
-                }
+                }]
             } else {
-                // hook_started / hook_response / status — quiet in the skeleton.
-                AgentEvent::Ignore
+                vec![]
             }
         }
 
-        // Token-level streaming (only present with --include-partial-messages).
+        // Token-level streaming (present with --include-partial-messages).
         "stream_event" => {
             let ev = v.get("event");
             let etype = ev
@@ -79,22 +95,22 @@ pub fn parse_line(line: &str) -> AgentEvent {
                 let delta = ev.and_then(|e| e.get("delta"));
                 if delta.and_then(|d| d.get("type")).and_then(Value::as_str) == Some("text_delta") {
                     if let Some(t) = delta.and_then(|d| d.get("text")).and_then(Value::as_str) {
-                        return AgentEvent::TextDelta(t.to_string());
+                        return vec![AgentEvent::TextDelta(t.to_string())];
                     }
                 }
             }
-            AgentEvent::Ignore
+            vec![]
         }
 
-        // A full assistant message: concat text blocks, else surface a tool_use.
+        // A full assistant message: text blocks and/or tool_use blocks.
         "assistant" => {
-            let content = v
+            let mut text = String::new();
+            let mut tools: Vec<(String, Value)> = Vec::new();
+            if let Some(arr) = v
                 .get("message")
                 .and_then(|m| m.get("content"))
-                .and_then(Value::as_array);
-            if let Some(arr) = content {
-                let mut text = String::new();
-                let mut tool: Option<String> = None;
+                .and_then(Value::as_array)
+            {
                 for block in arr {
                     match block.get("type").and_then(Value::as_str) {
                         Some("text") => {
@@ -103,27 +119,63 @@ pub fn parse_line(line: &str) -> AgentEvent {
                             }
                         }
                         Some("tool_use") => {
-                            tool = block.get("name").and_then(Value::as_str).map(String::from);
+                            let name = block
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .unwrap_or("tool")
+                                .to_string();
+                            let input = block.get("input").cloned().unwrap_or(Value::Null);
+                            tools.push((name, input));
                         }
                         _ => {}
                     }
                 }
+            }
+            let mut out = Vec::new();
+            if tools.is_empty() {
                 if !text.trim().is_empty() {
-                    return AgentEvent::AssistantFinal(text);
+                    out.push(AgentEvent::AssistantFinal(text));
                 }
-                if let Some(name) = tool {
-                    return AgentEvent::ToolUse(name);
+            } else {
+                // text (if any) already arrived via deltas; emit the tool calls
+                for (name, input) in tools {
+                    out.push(AgentEvent::ToolCall { name, input });
                 }
             }
-            AgentEvent::Ignore
+            out
         }
 
-        "result" => AgentEvent::TurnResult {
+        // Tool results come back as a "user" message with tool_result blocks.
+        "user" => {
+            let mut out = Vec::new();
+            if let Some(arr) = v
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(Value::as_array)
+            {
+                for block in arr {
+                    if block.get("type").and_then(Value::as_str) == Some("tool_result") {
+                        let ok = !block
+                            .get("is_error")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        let text = block
+                            .get("content")
+                            .map(tool_result_text)
+                            .unwrap_or_default();
+                        out.push(AgentEvent::ToolResult { ok, text });
+                    }
+                }
+            }
+            out
+        }
+
+        "result" => vec![AgentEvent::TurnResult {
             cost_usd: v.get("total_cost_usd").and_then(Value::as_f64).unwrap_or(0.0),
             is_error: v.get("is_error").and_then(Value::as_bool).unwrap_or(false),
             text: v.get("result").and_then(Value::as_str).map(String::from),
-        },
+        }],
 
-        _ => AgentEvent::Ignore,
+        _ => vec![],
     }
 }

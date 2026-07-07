@@ -45,8 +45,7 @@ async fn main() -> Result<()> {
         let file = args.get(pos + 1).cloned().unwrap_or_default();
         let data = std::fs::read_to_string(&file)?;
         for line in data.lines() {
-            let ev = protocol::parse_line(line);
-            if !matches!(ev, protocol::AgentEvent::Ignore) {
+            for ev in protocol::parse_line(line) {
                 println!("{ev:?}");
             }
         }

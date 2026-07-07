@@ -9,6 +9,8 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use tokio::sync::mpsc::UnboundedSender;
 use uuid::Uuid;
 
+use serde_json::Value;
+
 use crate::agent::{spawn_turn, TurnSpec};
 use crate::protocol::AgentEvent;
 use crate::store::{self, PersistChat, PersistSpace};
@@ -65,6 +67,7 @@ pub enum Entry {
     User(String),
     Assistant(String),
     Tool(String),
+    ToolResult { ok: bool, text: String },
     Note(String),
     Error(String),
 }
@@ -186,6 +189,79 @@ fn slug(s: &str) -> String {
     let mut out: String = one_line.chars().take(28).collect();
     if one_line.chars().count() > 28 {
         out.push('…');
+    }
+    out
+}
+
+fn short_path(p: &str) -> String {
+    if let Ok(cwd) = std::env::current_dir() {
+        let cwd = format!("{}/", cwd.display());
+        if let Some(rel) = p.strip_prefix(&cwd) {
+            return rel.to_string();
+        }
+    }
+    p.rsplit('/').next().unwrap_or(p).to_string()
+}
+
+fn truncate_str(s: &str, n: usize) -> String {
+    let one = s.replace('\n', " ");
+    if one.chars().count() > n {
+        format!("{}…", one.chars().take(n).collect::<String>())
+    } else {
+        one
+    }
+}
+
+fn truncate_lines(s: &str, n: usize) -> String {
+    let lines: Vec<&str> = s.lines().collect();
+    if lines.len() > n {
+        format!("{}\n… (+{} lines)", lines[..n].join("\n"), lines.len() - n)
+    } else {
+        s.trim_end().to_string()
+    }
+}
+
+/// Format a tool call the way Claude Code shows it: ⏺ Tool(arg) + a summary.
+fn format_tool(name: &str, input: &Value) -> String {
+    let get = |k: &str| input.get(k).and_then(|x| x.as_str()).unwrap_or("");
+    match name {
+        "Edit" | "MultiEdit" | "Update" => {
+            let f = short_path(get("file_path"));
+            let old = get("old_string");
+            let new = get("new_string");
+            let a = if new.is_empty() { 0 } else { new.lines().count().max(1) };
+            let r = if old.is_empty() { 0 } else { old.lines().count().max(1) };
+            format!("⏺ Update({f})\n  +{a} -{r}")
+        }
+        "Write" | "NotebookEdit" => {
+            let f = short_path(get("file_path"));
+            let n = get("content").lines().count();
+            format!("⏺ Write({f})\n  +{n}")
+        }
+        "Read" => format!("⏺ Read({})", short_path(get("file_path"))),
+        "Bash" => format!("⏺ Bash({})", truncate_str(get("command"), 64)),
+        "Grep" => format!("⏺ Grep({})", truncate_str(get("pattern"), 48)),
+        "Glob" => format!("⏺ Glob({})", truncate_str(get("pattern"), 48)),
+        "WebSearch" => format!("⏺ Search({})", truncate_str(get("query"), 48)),
+        "WebFetch" => format!("⏺ Fetch({})", truncate_str(get("url"), 56)),
+        "Task" => format!("⏺ Task({})", truncate_str(get("description"), 48)),
+        "TodoWrite" => format_todos(input),
+        other => format!("⏺ {other}"),
+    }
+}
+
+fn format_todos(input: &Value) -> String {
+    let mut out = String::from("⏺ Todos");
+    if let Some(arr) = input.get("todos").and_then(Value::as_array) {
+        for t in arr {
+            let content = t.get("content").and_then(Value::as_str).unwrap_or("");
+            let mark = match t.get("status").and_then(Value::as_str) {
+                Some("completed") => "✔",
+                Some("in_progress") => "▶",
+                _ => "☐",
+            };
+            out.push_str(&format!("\n  {mark} {content}"));
+        }
     }
     out
 }
@@ -409,10 +485,17 @@ impl App {
                         c.streaming = Some(s);
                     }
                 }
-                AgentEvent::ToolUse(name) => {
+                AgentEvent::ToolCall { name, input } => {
                     c.commit_streaming();
-                    c.transcript.push(Entry::Tool(name));
+                    c.transcript.push(Entry::Tool(format_tool(&name, &input)));
                     c.follow = true;
+                }
+                AgentEvent::ToolResult { ok, text } => {
+                    let t = truncate_lines(&text, 6);
+                    if !t.trim().is_empty() {
+                        c.transcript.push(Entry::ToolResult { ok, text: t });
+                        c.follow = true;
+                    }
                 }
                 AgentEvent::TurnResult { cost_usd, is_error, text } => {
                     if c.streaming.as_ref().map_or(true, |x| x.trim().is_empty()) {
@@ -429,17 +512,7 @@ impl App {
                         c.transcript.push(Entry::Error("turn ended with error".into()));
                     }
                     c.follow = true;
-                    if !c.autonamed {
-                        if let Some(p) = c.transcript.iter().find_map(|e| match e {
-                            Entry::User(t) => Some(t.clone()),
-                            _ => None,
-                        }) {
-                            c.title = slug(&p);
-                            c.autonamed = true;
-                        }
-                    }
                 }
-                AgentEvent::Ignore => {}
             }
         }
         self.spinner = self.spinner.wrapping_add(1);
@@ -1414,14 +1487,22 @@ Working directory: {cwd}. You're in a terminal on macOS (tmux/Ghostty) — keep 
         }
         let ai = self.active_space;
         let fi = self.spaces[ai].fi();
-        if self.spaces[ai].chats[fi].in_flight {
+        // /clear: wipe the transcript and start a fresh claude session
+        if prompt == "/clear" {
+            let c = &mut self.spaces[ai].chats[fi];
+            c.transcript.clear();
+            c.transcript.push(Entry::Note("cleared".into()));
+            c.streaming = None;
+            c.cost = 0.0;
+            c.first_turn = true;
+            c.session_id = Uuid::new_v4().to_string();
+            self.input.clear();
+            self.mode = Mode::Normal;
+            self.persist();
             return;
         }
-        // Name the chat instantly from the first prompt — a local text slug, no
-        // claude call involved.
-        if !self.spaces[ai].chats[fi].autonamed {
-            self.spaces[ai].chats[fi].title = slug(&prompt);
-            self.spaces[ai].chats[fi].autonamed = true;
+        if self.spaces[ai].chats[fi].in_flight {
+            return;
         }
         self.input.clear();
         self.mode = Mode::Normal;

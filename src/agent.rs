@@ -14,7 +14,7 @@ use tokio::process::Command;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::app::Msg;
-use crate::protocol::{parse_line, AgentEvent};
+use crate::protocol::parse_line;
 
 pub struct TurnSpec {
     pub chat: u64,
@@ -91,12 +91,9 @@ pub fn spawn_turn(spec: TurnSpec, tx: UnboundedSender<Msg>) {
 
         let mut lines = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            match parse_line(&line) {
-                AgentEvent::Ignore => {}
-                ev => {
-                    if tx.send(Msg::Agent { chat: spec.chat, ev }).is_err() {
-                        return; // app gone
-                    }
+            for ev in parse_line(&line) {
+                if tx.send(Msg::Agent { chat: spec.chat, ev }).is_err() {
+                    return; // app gone
                 }
             }
         }
