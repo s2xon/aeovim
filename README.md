@@ -21,3 +21,5 @@ Single-user, local macOS daily driver. Not distributed.
 ## Status
 
 Pre-implementation. Design complete; the walking-skeleton spike is next (see the plan).
+
+<img width="1512" height="950" alt="image" src="https://github.com/user-attachments/assets/283b1478-1fd5-4673-8ab3-c4d0c5921605" />
