@@ -30,6 +30,12 @@ pub enum Focus {
 }
 
 #[derive(PartialEq, Clone, Copy)]
+pub enum RenameTarget {
+    Space,
+    Chat,
+}
+
+#[derive(PartialEq, Clone, Copy)]
 pub enum SplitDir {
     V,
     H,
@@ -165,10 +171,11 @@ pub fn chat_title(c: &Chat) -> String {
 pub fn space_name(sp: &Space) -> String {
     if !sp.name.trim().is_empty() {
         sp.name.clone()
-    } else if sp.chats.len() == 1 {
-        chat_title(&sp.chats[0])
     } else {
-        "space".to_string()
+        sp.chats
+            .first()
+            .map(chat_title)
+            .unwrap_or_else(|| "space".to_string())
     }
 }
 
@@ -199,6 +206,7 @@ pub struct App {
     pub input: String,
     pub cmd: String,
     pub rename_buf: String,
+    pub rename_target: RenameTarget,
     pub picker_query: String,
     pub picker_sel: usize,
     pub spaces: Vec<Space>,
@@ -216,6 +224,7 @@ pub struct App {
     pub help_open: bool,
     next_chat_id: u64,
     next_space_id: u64,
+    chat_counter: u64,
     workspace_key: String,
     tx: UnboundedSender<Msg>,
 }
@@ -232,6 +241,7 @@ impl App {
         let mut spaces = Vec::new();
         let mut next_chat_id = 1u64;
         let mut next_space_id = 1u64;
+        let mut chat_counter = 1u64;
 
         for ps in &restored {
             let mut chats: Vec<Chat> = Vec::new();
@@ -253,8 +263,10 @@ impl App {
             next_space_id += 1;
         }
         if spaces.is_empty() {
-            let c = Chat::fresh(next_chat_id);
+            let mut c = Chat::fresh(next_chat_id);
             next_chat_id += 1;
+            c.title = format!("chat{chat_counter}");
+            chat_counter += 1;
             spaces.push(Space::one(next_space_id, c));
             next_space_id += 1;
         }
@@ -266,6 +278,7 @@ impl App {
             input: String::new(),
             cmd: String::new(),
             rename_buf: String::new(),
+            rename_target: RenameTarget::Space,
             picker_query: String::new(),
             picker_sel: 0,
             spaces,
@@ -283,6 +296,7 @@ impl App {
             help_open: false,
             next_chat_id,
             next_space_id,
+            chat_counter,
             workspace_key,
             tx,
         }
@@ -835,12 +849,21 @@ impl App {
 
     // ---- space / chat lifecycle ----
 
+    fn next_chat_title(&mut self) -> String {
+        let n = self.chat_counter;
+        self.chat_counter += 1;
+        format!("chat{n}")
+    }
+
     fn new_space(&mut self) -> usize {
         let cid = self.next_chat_id;
         self.next_chat_id += 1;
         let sid = self.next_space_id;
         self.next_space_id += 1;
-        self.spaces.push(Space::one(sid, Chat::fresh(cid)));
+        let title = self.next_chat_title();
+        let mut c = Chat::fresh(cid);
+        c.title = title;
+        self.spaces.push(Space::one(sid, c));
         self.active_space = self.spaces.len() - 1;
         self.sidebar_cursor = self.active_space;
         self.persist();
@@ -851,6 +874,7 @@ impl App {
         self.new_space();
         self.sidebar_open = true;
         self.focus = Focus::Sidebar;
+        self.rename_target = RenameTarget::Space;
         self.rename_buf.clear();
         self.mode = Mode::Rename;
     }
@@ -861,9 +885,12 @@ impl App {
         }
         let cid = self.next_chat_id;
         self.next_chat_id += 1;
+        let title = self.next_chat_title();
         {
             let sp = &mut self.spaces[self.active_space];
-            sp.chats.push(Chat::fresh(cid));
+            let mut c = Chat::fresh(cid);
+            c.title = title;
+            sp.chats.push(c);
             sp.focused = sp.chats.len() - 1;
             sp.zoom = false;
         }
@@ -1027,22 +1054,40 @@ impl App {
     }
 
     fn rename_start(&mut self) {
-        let idx = if self.focus == Focus::Sidebar {
-            self.sidebar_cursor
+        if self.focus == Focus::Main {
+            // rename the focused chat (input shows in the composer)
+            self.rename_target = RenameTarget::Chat;
+            let ai = self.active_space;
+            let fi = self.spaces[ai].fi();
+            self.rename_buf = self.spaces[ai].chats[fi].title.clone();
         } else {
-            self.active_space
+            // rename the space (inline in the sidebar)
+            self.rename_target = RenameTarget::Space;
+            let idx = self.sidebar_cursor.min(self.spaces.len().saturating_sub(1));
+            self.sidebar_open = true;
+            self.focus = Focus::Sidebar;
+            self.sidebar_cursor = idx;
+            self.rename_buf = self.spaces[idx].name.clone();
         }
-        .min(self.spaces.len().saturating_sub(1));
-        self.sidebar_open = true;
-        self.focus = Focus::Sidebar;
-        self.sidebar_cursor = idx;
-        self.rename_buf = self.spaces[idx].name.clone();
         self.mode = Mode::Rename;
     }
 
     fn rename_commit(&mut self) {
-        let idx = self.sidebar_cursor.min(self.spaces.len().saturating_sub(1));
-        self.spaces[idx].name = self.rename_buf.trim().to_string();
+        match self.rename_target {
+            RenameTarget::Space => {
+                let idx = self.sidebar_cursor.min(self.spaces.len().saturating_sub(1));
+                self.spaces[idx].name = self.rename_buf.trim().to_string();
+            }
+            RenameTarget::Chat => {
+                let ai = self.active_space;
+                let fi = self.spaces[ai].fi();
+                let name = self.rename_buf.trim().to_string();
+                if !name.is_empty() {
+                    self.spaces[ai].chats[fi].title = name;
+                    self.spaces[ai].chats[fi].autonamed = true;
+                }
+            }
+        }
         self.mode = Mode::Normal;
         self.persist();
     }

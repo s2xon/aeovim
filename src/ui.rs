@@ -8,7 +8,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::app::{chat_title, space_name, App, Chat, Entry, Focus, Mode, Pending, SplitDir};
+use crate::app::{
+    chat_title, space_name, App, Chat, Entry, Focus, Mode, Pending, RenameTarget, SplitDir,
+};
 use crate::theme as t;
 
 const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -76,7 +78,8 @@ fn render_sidebar(f: &mut Frame, area: Rect, app: &App) {
         let is_active = i == app.active_space;
         let is_cursor = focused && i == app.sidebar_cursor;
         let is_selected = app.is_selected(sp.id);
-        let editing = app.mode == Mode::Rename && is_cursor;
+        let editing =
+            app.mode == Mode::Rename && is_cursor && app.rename_target == RenameTarget::Space;
         let inflight = sp.chats.iter().any(|c| c.in_flight);
 
         let glyph = if is_selected {
@@ -314,11 +317,11 @@ fn build_lines(chat: &Chat, spin: usize) -> Vec<Line<'static>> {
         out.push(Line::from(Span::styled("claude", asst_lbl)));
         let parts: Vec<&str> = s.split('\n').collect();
         for (j, l) in parts.iter().enumerate() {
-            let mut content = format!("  {l}");
+            let mut line = md_line("  ", l, body);
             if j + 1 == parts.len() {
-                content.push('▌');
+                line.spans.push(Span::styled("▌".to_string(), body));
             }
-            out.push(Line::from(Span::styled(content, body)));
+            out.push(line);
         }
     } else if chat.in_flight {
         if !chat.transcript.is_empty() {
@@ -333,10 +336,97 @@ fn build_lines(chat: &Chat, spin: usize) -> Vec<Line<'static>> {
     out
 }
 
+fn md_flush(out: &mut Vec<Span<'static>>, buf: &mut String, base: Style) {
+    if !buf.is_empty() {
+        out.push(Span::styled(std::mem::take(buf), base));
+    }
+}
+
+fn find_bold(s: &[char], from: usize) -> Option<usize> {
+    let mut i = from;
+    while i + 1 < s.len() {
+        if s[i] == '*' && s[i + 1] == '*' {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Small inline markdown: **bold**, *italic* / _italic_, `code`.
+fn md_spans(text: &str, base: Style) -> Vec<Span<'static>> {
+    let s: Vec<char> = text.chars().collect();
+    let n = s.len();
+    let mut out: Vec<Span> = Vec::new();
+    let mut buf = String::new();
+    let code_st = Style::default().fg(t::PERI);
+    let mut i = 0;
+    while i < n {
+        if s[i] == '`' {
+            if let Some(j) = (i + 1..n).find(|&k| s[k] == '`') {
+                md_flush(&mut out, &mut buf, base);
+                out.push(Span::styled(s[i + 1..j].iter().collect::<String>(), code_st));
+                i = j + 1;
+                continue;
+            }
+        }
+        if s[i] == '*' && i + 1 < n && s[i + 1] == '*' {
+            if let Some(j) = find_bold(&s, i + 2) {
+                md_flush(&mut out, &mut buf, base);
+                out.push(Span::styled(
+                    s[i + 2..j].iter().collect::<String>(),
+                    base.add_modifier(Modifier::BOLD),
+                ));
+                i = j + 2;
+                continue;
+            }
+        }
+        if s[i] == '*' || s[i] == '_' {
+            let d = s[i];
+            if let Some(j) = (i + 1..n).find(|&k| s[k] == d) {
+                if j > i + 1 {
+                    md_flush(&mut out, &mut buf, base);
+                    out.push(Span::styled(
+                        s[i + 1..j].iter().collect::<String>(),
+                        base.add_modifier(Modifier::ITALIC),
+                    ));
+                    i = j + 1;
+                    continue;
+                }
+            }
+        }
+        buf.push(s[i]);
+        i += 1;
+    }
+    md_flush(&mut out, &mut buf, base);
+    out
+}
+
+/// A transcript body line: indent prefix + markdown (headers rendered bold).
+fn md_line(prefix: &str, text: &str, base: Style) -> Line<'static> {
+    let trimmed = text.trim_start();
+    let header = trimmed
+        .strip_prefix("### ")
+        .or_else(|| trimmed.strip_prefix("## "))
+        .or_else(|| trimmed.strip_prefix("# "));
+    if let Some(rest) = header {
+        return Line::from(vec![
+            Span::styled(prefix.to_string(), base),
+            Span::styled(
+                rest.to_string(),
+                Style::default().fg(t::PURPLE).add_modifier(Modifier::BOLD),
+            ),
+        ]);
+    }
+    let mut spans = vec![Span::styled(prefix.to_string(), base)];
+    spans.extend(md_spans(text, base));
+    Line::from(spans)
+}
+
 fn push_block(out: &mut Vec<Line<'static>>, label: &str, lbl: Style, text: &str, body: Style) {
     out.push(Line::from(Span::styled(label.to_string(), lbl)));
     for l in text.split('\n') {
-        out.push(Line::from(Span::styled(format!("  {l}"), body)));
+        out.push(md_line("  ", l, body));
     }
 }
 
@@ -364,8 +454,12 @@ fn render_composer(f: &mut Frame, area: Rect, app: &App) {
             Span::styled(": ".to_string(), Style::default().fg(accent)),
             Span::styled(app.cmd.clone(), Style::default().fg(t::FG)),
         ]),
+        Mode::Rename if app.rename_target == RenameTarget::Chat => Line::from(vec![
+            Span::styled("rename ❯ ".to_string(), Style::default().fg(accent)),
+            Span::styled(app.rename_buf.clone(), Style::default().fg(t::FG)),
+        ]),
         Mode::Rename => Line::from(Span::styled(
-            " naming in sidebar — type a name · Enter confirm · Esc cancel",
+            " renaming space in sidebar — Enter confirm · Esc cancel",
             Style::default().fg(t::DIM),
         )),
         _ => Line::from(Span::styled(
@@ -378,6 +472,9 @@ fn render_composer(f: &mut Frame, area: Rect, app: &App) {
     let cursor_col = match app.mode {
         Mode::Insert => Some(2 + app.input.chars().count()),
         Mode::Command => Some(2 + app.cmd.chars().count()),
+        Mode::Rename if app.rename_target == RenameTarget::Chat => {
+            Some(9 + app.rename_buf.chars().count())
+        }
         _ => None,
     };
     if let Some(col) = cursor_col {
