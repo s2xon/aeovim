@@ -136,7 +136,7 @@ async fn run(
         if app.should_quit {
             break;
         }
-        if is_tick && !app.chats.iter().any(|c| c.in_flight) {
+        if is_tick && !app.any_in_flight() {
             continue;
         }
         terminal.draw(|f| ui::render(f, app))?;

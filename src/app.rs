@@ -1,10 +1,9 @@
-//! App state + update logic. Keymap ported from the user's nvim (leader = Space,
-//! Ctrl-hjkl focus, nvim-tree sidebar keys, harpoon number-jump).
+//! App state + update logic — two-level model.
 //!
-//! Panes: the main area holds one or more *panes* (slots) arranged as a vertical
-//! split, horizontal split, or 2x2 grid. Each pane holds an ordered list of
-//! chats as *inter-tabs*; `Tab` cycles tabs within the focused pane only.
-//! `Space s c` fuzzy-finds a chat and merges it into the focused pane.
+//! A **Space** is a named container of 1–4 **Chats**. The sidebar lists spaces;
+//! the active space renders its chats as split panes. Every chat belongs to
+//! exactly one space; deleting a space's last chat deletes the space. Spaces can
+//! be merged (chats combined, ≤4) and a chat can be popped out into its own space.
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use tokio::sync::mpsc::UnboundedSender;
@@ -12,7 +11,7 @@ use uuid::Uuid;
 
 use crate::agent::{spawn_turn, TurnSpec};
 use crate::protocol::AgentEvent;
-use crate::store::{self, PersistChat};
+use crate::store::{self, PersistChat, PersistSpace};
 
 #[derive(PartialEq, Clone, Copy)]
 pub enum Mode {
@@ -34,13 +33,6 @@ pub enum Focus {
 pub enum SplitDir {
     V,
     H,
-}
-
-/// What the fuzzy-picker does on commit.
-#[derive(PartialEq, Clone, Copy)]
-enum PickerAction {
-    AddTab,   // Space s c — add the chosen chat as a tab in this space
-    OpenHere, // Space s v/h — fill the freshly-split space with the chosen chat
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -72,7 +64,6 @@ pub enum Entry {
 pub struct Chat {
     pub id: u64,
     pub title: String,
-    pub qualifier: Option<String>,
     pub autonamed: bool,
     pub transcript: Vec<Entry>,
     pub streaming: Option<String>,
@@ -93,7 +84,6 @@ impl Chat {
         Chat {
             id,
             title: String::new(),
-            qualifier: None,
             autonamed: false,
             transcript,
             streaming: None,
@@ -107,21 +97,20 @@ impl Chat {
         }
     }
 
-    fn from_persist(id: u64, pc: PersistChat) -> Self {
+    fn from_persist(id: u64, pc: &PersistChat) -> Self {
         let mut transcript = Vec::new();
         transcript.push(Entry::Note(format!(
-            "resumed · session {} (context preserved — send a message to continue)",
+            "resumed · session {} (send a message to continue)",
             &pc.session_id[..8.min(pc.session_id.len())]
         )));
         Chat {
             id,
-            title: pc.title,
-            qualifier: pc.qualifier,
+            title: pc.title.clone(),
             autonamed: true,
             transcript,
             streaming: None,
             in_flight: false,
-            session_id: pc.session_id,
+            session_id: pc.session_id.clone(),
             first_turn: false,
             cost: pc.cost,
             scroll: 0,
@@ -139,15 +128,47 @@ impl Chat {
     }
 }
 
-/// A slot on screen holding one or more chats as inter-tabs.
-pub struct Pane {
-    pub tabs: Vec<u64>, // chat ids
-    pub active_tab: usize,
+pub struct Space {
+    pub id: u64,
+    pub name: String,
+    pub chats: Vec<Chat>,
+    pub focused: usize,
+    pub split_dir: SplitDir,
+    pub zoom: bool,
 }
 
-impl Pane {
-    fn current(&self) -> u64 {
-        self.tabs[self.active_tab.min(self.tabs.len().saturating_sub(1))]
+impl Space {
+    fn one(id: u64, chat: Chat) -> Self {
+        Space {
+            id,
+            name: String::new(),
+            chats: vec![chat],
+            focused: 0,
+            split_dir: SplitDir::V,
+            zoom: false,
+        }
+    }
+    pub fn fi(&self) -> usize {
+        self.focused.min(self.chats.len().saturating_sub(1))
+    }
+}
+
+pub fn chat_title(c: &Chat) -> String {
+    if c.title.trim().is_empty() {
+        "untitled".to_string()
+    } else {
+        c.title.clone()
+    }
+}
+
+/// Display name for a space: its name, else (single chat) the chat's title.
+pub fn space_name(sp: &Space) -> String {
+    if !sp.name.trim().is_empty() {
+        sp.name.clone()
+    } else if sp.chats.len() == 1 {
+        chat_title(&sp.chats[0])
+    } else {
+        "space".to_string()
     }
 }
 
@@ -177,26 +198,23 @@ pub struct App {
     pub input: String,
     pub cmd: String,
     pub rename_buf: String,
+    pub picker_query: String,
+    pub picker_sel: usize,
+    pub spaces: Vec<Space>,
+    pub active_space: usize,
+    pub sidebar_cursor: usize,
+    pub sidebar_open: bool,
     selected: Vec<u64>,
     pending_delete: Vec<u64>,
     pub confirm_msg: String,
-    pub picker_query: String,
-    pub picker_sel: usize,
-    picker_action: PickerAction,
-    pub chats: Vec<Chat>,
-    pub panes: Vec<Pane>,
-    pub active_pane: usize,
-    pub split_dir: SplitDir,
-    pub zoom: bool,
-    pub sidebar_cursor: usize,
-    pub sidebar_open: bool,
     pub model_cli: Option<String>,
     pub model_display: String,
     pub dangerous: bool,
     pub should_quit: bool,
     pub spinner: usize,
     pub help_open: bool,
-    next_id: u64,
+    next_chat_id: u64,
+    next_space_id: u64,
     workspace_key: String,
     tx: UnboundedSender<Msg>,
 }
@@ -207,21 +225,39 @@ impl App {
         dangerous: bool,
         tx: UnboundedSender<Msg>,
         workspace_key: String,
-        restored: Vec<PersistChat>,
+        restored: Vec<PersistSpace>,
     ) -> Self {
         let model_display = model_cli.clone().unwrap_or_else(|| "default".into());
-        let mut chats = Vec::new();
-        let mut next_id = 1u64;
-        if restored.is_empty() {
-            chats.push(Chat::fresh(next_id));
-            next_id += 1;
-        } else {
-            for pc in restored {
-                chats.push(Chat::from_persist(next_id, pc));
-                next_id += 1;
+        let mut spaces = Vec::new();
+        let mut next_chat_id = 1u64;
+        let mut next_space_id = 1u64;
+
+        for ps in &restored {
+            let mut chats: Vec<Chat> = Vec::new();
+            for pc in ps.chats.iter().take(4) {
+                chats.push(Chat::from_persist(next_chat_id, pc));
+                next_chat_id += 1;
             }
+            if chats.is_empty() {
+                continue;
+            }
+            spaces.push(Space {
+                id: next_space_id,
+                name: ps.name.clone(),
+                chats,
+                focused: 0,
+                split_dir: SplitDir::V,
+                zoom: false,
+            });
+            next_space_id += 1;
         }
-        let first_id = chats[0].id;
+        if spaces.is_empty() {
+            let c = Chat::fresh(next_chat_id);
+            next_chat_id += 1;
+            spaces.push(Space::one(next_space_id, c));
+            next_space_id += 1;
+        }
+
         Self {
             mode: Mode::Normal,
             focus: Focus::Main,
@@ -229,112 +265,85 @@ impl App {
             input: String::new(),
             cmd: String::new(),
             rename_buf: String::new(),
+            picker_query: String::new(),
+            picker_sel: 0,
+            spaces,
+            active_space: 0,
+            sidebar_cursor: 0,
+            sidebar_open: true,
             selected: Vec::new(),
             pending_delete: Vec::new(),
             confirm_msg: String::new(),
-            picker_query: String::new(),
-            picker_sel: 0,
-            picker_action: PickerAction::AddTab,
-            chats,
-            panes: vec![Pane {
-                tabs: vec![first_id],
-                active_tab: 0,
-            }],
-            active_pane: 0,
-            split_dir: SplitDir::V,
-            zoom: false,
-            sidebar_cursor: 0,
-            sidebar_open: true,
             model_cli,
             model_display,
             dangerous,
             should_quit: false,
             spinner: 0,
             help_open: false,
-            next_id,
+            next_chat_id,
+            next_space_id,
             workspace_key,
             tx,
         }
     }
 
-    // ---- chat / pane lookups ----
+    // ---- lookups ----
 
-    fn chat_index(&self, id: u64) -> Option<usize> {
-        self.chats.iter().position(|c| c.id == id)
-    }
-    fn chat_by_id(&mut self, id: u64) -> Option<&mut Chat> {
-        self.chats.iter_mut().find(|c| c.id == id)
-    }
-    pub fn cur_id(&self) -> u64 {
-        self.panes[self.active_pane].current()
-    }
-    fn cur_idx(&self) -> usize {
-        self.chat_index(self.cur_id()).unwrap_or(0)
-    }
     pub fn cur_chat(&self) -> &Chat {
-        &self.chats[self.cur_idx()]
+        let sp = &self.spaces[self.active_space];
+        &sp.chats[sp.fi()]
     }
     fn cur_chat_mut(&mut self) -> &mut Chat {
-        let i = self.cur_idx();
-        &mut self.chats[i]
+        let ai = self.active_space;
+        let fi = self.spaces[ai].fi();
+        &mut self.spaces[ai].chats[fi]
     }
-    pub fn sel_id(&self) -> Option<u64> {
-        let order = self.visible_order();
-        order.get(self.sidebar_cursor).map(|&i| self.chats[i].id)
+    fn chat_by_id_mut(&mut self, id: u64) -> Option<&mut Chat> {
+        for sp in &mut self.spaces {
+            for c in &mut sp.chats {
+                if c.id == id {
+                    return Some(c);
+                }
+            }
+        }
+        None
     }
-    pub fn is_open(&self, id: u64) -> bool {
-        self.panes.iter().any(|p| p.tabs.contains(&id))
+    fn space_index(&self, id: u64) -> Option<usize> {
+        self.spaces.iter().position(|s| s.id == id)
+    }
+    pub fn sel_space_id(&self) -> Option<u64> {
+        self.spaces.get(self.sidebar_cursor).map(|s| s.id)
     }
     pub fn is_selected(&self, id: u64) -> bool {
         self.selected.contains(&id)
     }
+    pub fn any_in_flight(&self) -> bool {
+        self.spaces
+            .iter()
+            .any(|sp| sp.chats.iter().any(|c| c.in_flight))
+    }
 
     pub fn persist(&self) {
-        let data: Vec<PersistChat> = self
-            .chats
+        let data: Vec<PersistSpace> = self
+            .spaces
             .iter()
-            .map(|c| PersistChat {
-                title: c.title.clone(),
-                qualifier: c.qualifier.clone(),
-                session_id: c.session_id.clone(),
-                cost: c.cost,
+            .map(|sp| PersistSpace {
+                name: sp.name.clone(),
+                chats: sp
+                    .chats
+                    .iter()
+                    .map(|c| PersistChat {
+                        title: c.title.clone(),
+                        session_id: c.session_id.clone(),
+                        cost: c.cost,
+                    })
+                    .collect(),
             })
             .collect();
         store::save(&self.workspace_key, &data);
     }
 
-    /// Display order: flat (unqualified) first, then each qualifier group.
-    pub fn visible_order(&self) -> Vec<usize> {
-        let mut order = Vec::new();
-        for (i, c) in self.chats.iter().enumerate() {
-            if c.qualifier.is_none() {
-                order.push(i);
-            }
-        }
-        let mut quals: Vec<String> = Vec::new();
-        for c in &self.chats {
-            if let Some(q) = &c.qualifier {
-                if !quals.contains(q) {
-                    quals.push(q.clone());
-                }
-            }
-        }
-        for q in &quals {
-            for (i, c) in self.chats.iter().enumerate() {
-                if c.qualifier.as_ref() == Some(q) {
-                    order.push(i);
-                }
-            }
-        }
-        order
-    }
-
-    fn sidebar_to(&mut self, id: u64) {
-        let order = self.visible_order();
-        if let Some(pos) = order.iter().position(|&i| self.chats[i].id == id) {
-            self.sidebar_cursor = pos;
-        }
-    }
+    // ---- events ----
 
     pub fn handle(&mut self, msg: Msg) {
         match msg {
@@ -343,7 +352,7 @@ impl App {
             Msg::Input(_) => {}
             Msg::Agent { chat, ev } => self.handle_agent(chat, ev),
             Msg::TurnEnded { chat, error } => {
-                if let Some(c) = self.chat_by_id(chat) {
+                if let Some(c) = self.chat_by_id_mut(chat) {
                     if c.in_flight {
                         c.commit_streaming();
                         c.in_flight = false;
@@ -361,7 +370,7 @@ impl App {
     fn handle_agent(&mut self, id: u64, ev: AgentEvent) {
         let is_result = matches!(ev, AgentEvent::TurnResult { .. });
         let mut model_update = None;
-        if let Some(c) = self.chat_by_id(id) {
+        if let Some(c) = self.chat_by_id_mut(id) {
             match ev {
                 AgentEvent::Init { session_id, model } => {
                     if let Some(s) = session_id {
@@ -519,14 +528,25 @@ impl App {
         }
     }
 
-    fn picker_down(&mut self) {
-        let n = self.picker_candidates().len();
-        if n > 0 {
-            self.picker_sel = (self.picker_sel + 1).min(n - 1);
+    fn key_confirm(&mut self, k: KeyEvent) {
+        match k.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                let ids = std::mem::take(&mut self.pending_delete);
+                for id in ids {
+                    if let Some(i) = self.space_index(id) {
+                        self.delete_space_at(i);
+                    }
+                }
+                self.selected.clear();
+                self.mode = Mode::Normal;
+                self.persist();
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.pending_delete.clear();
+                self.mode = Mode::Normal;
+            }
+            _ => {}
         }
-    }
-    fn picker_up(&mut self) {
-        self.picker_sel = self.picker_sel.saturating_sub(1);
     }
 
     fn key_normal(&mut self, k: KeyEvent, ctrl: bool) {
@@ -550,25 +570,30 @@ impl App {
                 self.cur_chat_mut().follow = true;
             }
             KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Char('H') => self.pane_tab_cycle(-1),
-            KeyCode::Char('L') => self.pane_tab_cycle(1),
+            KeyCode::Char('H') => self.pane_cycle(-1),
+            KeyCode::Char('L') => self.pane_cycle(1),
             KeyCode::Char('g') => self.pending = Pending::G,
             KeyCode::Char('G') => self.cur_chat_mut().follow = true,
-            KeyCode::Char('n') => self.new_chat(),
-            KeyCode::Char('a') if self.focus == Focus::Sidebar => self.new_named_chat(),
+            KeyCode::Char('n') => {
+                self.new_space();
+                self.focus = Focus::Main;
+                self.mode = Mode::Insert;
+            }
+            KeyCode::Char('a') if self.focus == Focus::Sidebar => self.new_named_space(),
             KeyCode::Char('r') => self.rename_start(),
             KeyCode::Char('s') if self.focus == Focus::Sidebar => self.toggle_select(),
+            KeyCode::Char('m') if self.focus == Focus::Sidebar => self.merge_selected(),
             KeyCode::Char('d') if self.focus == Focus::Sidebar => self.request_delete(),
             KeyCode::Char('}') => {
                 if self.focus == Focus::Sidebar {
-                    self.sidebar_group_jump(1)
+                    self.sidebar_move(5)
                 } else {
                     self.scroll_down(10)
                 }
             }
             KeyCode::Char('{') => {
                 if self.focus == Focus::Sidebar {
-                    self.sidebar_group_jump(-1)
+                    self.sidebar_move(-5)
                 } else {
                     self.scroll_up(10)
                 }
@@ -590,13 +615,13 @@ impl App {
             KeyCode::Char('h') | KeyCode::Left => self.focus_dir(Dir::Left),
             KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => {
                 if self.focus == Focus::Sidebar {
-                    self.open_selected()
+                    self.activate_selected()
                 } else {
                     self.focus_dir(Dir::Right)
                 }
             }
-            KeyCode::Tab => self.pane_tab_cycle(1),
-            KeyCode::BackTab => self.pane_tab_cycle(-1),
+            KeyCode::Tab => self.pane_cycle(1),
+            KeyCode::BackTab => self.pane_cycle(-1),
             _ => {}
         }
     }
@@ -611,8 +636,8 @@ impl App {
                         c.follow = false;
                         c.scroll = 0;
                     }
-                    KeyCode::Char('t') => self.pane_tab_cycle(1),
-                    KeyCode::Char('T') => self.pane_tab_cycle(-1),
+                    KeyCode::Char('t') => self.pane_cycle(1),
+                    KeyCode::Char('T') => self.pane_cycle(-1),
                     _ => {}
                 }
             }
@@ -626,7 +651,7 @@ impl App {
                 KeyCode::Char('t') => self.pending = Pending::LeaderT,
                 KeyCode::Char('a') => {
                     self.pending = Pending::None;
-                    self.new_named_chat();
+                    self.new_named_space();
                 }
                 KeyCode::Char(d @ '0'..='9') => {
                     self.pending = Pending::None;
@@ -637,29 +662,29 @@ impl App {
             Pending::LeaderS => {
                 self.pending = Pending::None;
                 match k.code {
-                    KeyCode::Char('v') => {
-                        self.split(SplitDir::V);
-                        self.open_picker(PickerAction::OpenHere);
+                    KeyCode::Char('c') => self.open_picker(),
+                    KeyCode::Char('n') => self.add_chat_to_active(),
+                    KeyCode::Char('p') => self.pop_chat(),
+                    KeyCode::Char('x') => self.close_focused_pane(),
+                    KeyCode::Char('v') => self.spaces[self.active_space].split_dir = SplitDir::V,
+                    KeyCode::Char('h') => self.spaces[self.active_space].split_dir = SplitDir::H,
+                    KeyCode::Char('m') => {
+                        let z = self.spaces[self.active_space].zoom;
+                        self.spaces[self.active_space].zoom = !z;
                     }
-                    KeyCode::Char('h') => {
-                        self.split(SplitDir::H);
-                        self.open_picker(PickerAction::OpenHere);
-                    }
-                    KeyCode::Char('c') => self.open_picker(PickerAction::AddTab),
-                    KeyCode::Char('x') => self.close_pane(),
-                    KeyCode::Char('d') => self.detach_tab(),
-                    KeyCode::Char('o') => self.only_pane(),
-                    KeyCode::Char('m') => self.zoom = !self.zoom,
                     _ => {}
                 }
             }
             Pending::LeaderT => {
                 self.pending = Pending::None;
                 match k.code {
-                    KeyCode::Char('o') | KeyCode::Char('f') => self.new_chat(),
-                    KeyCode::Char('x') => self.delete_chat(self.cur_id()),
-                    KeyCode::Char('n') => self.pane_tab_cycle(1),
-                    KeyCode::Char('p') => self.pane_tab_cycle(-1),
+                    KeyCode::Char('o') | KeyCode::Char('f') => {
+                        self.new_space();
+                        self.mode = Mode::Insert;
+                    }
+                    KeyCode::Char('x') => self.close_focused_pane(),
+                    KeyCode::Char('n') => self.pane_cycle(1),
+                    KeyCode::Char('p') => self.pane_cycle(-1),
                     _ => {}
                 }
             }
@@ -673,24 +698,27 @@ impl App {
         }
     }
 
-    // ---- focus / panes ----
+    // ---- focus / panes within the active space ----
 
     fn focus_sidebar(&mut self) {
         self.focus = Focus::Sidebar;
         self.sidebar_open = true;
-        self.sidebar_to(self.cur_id());
+        self.sidebar_cursor = self.active_space;
     }
 
-    /// Space e: toggle the sidebar and move focus with it — open focuses the
-    /// sidebar, close focuses the chat window.
     fn toggle_sidebar(&mut self) {
         self.sidebar_open = !self.sidebar_open;
         if self.sidebar_open {
             self.focus = Focus::Sidebar;
-            self.sidebar_to(self.cur_id());
+            self.sidebar_cursor = self.active_space;
         } else {
             self.focus = Focus::Main;
         }
+    }
+
+    fn activate_selected(&mut self) {
+        self.active_space = self.sidebar_cursor.min(self.spaces.len().saturating_sub(1));
+        self.focus = Focus::Main;
     }
 
     fn focus_dir(&mut self, dir: Dir) {
@@ -700,44 +728,24 @@ impl App {
             }
             return;
         }
-        // focus == Main
-        let n = self.panes.len();
-        let cur = self.active_pane;
-        // returns Some(pane) to move to, or None; special: usize::MAX => sidebar
-        let target: Option<usize> = if n == 1 {
+        let sp = &self.spaces[self.active_space];
+        let n = sp.chats.len();
+        let cur = sp.fi();
+        let target: Option<usize> = if n <= 1 {
             match dir {
                 Dir::Left => Some(usize::MAX),
                 _ => None,
             }
         } else if n == 2 {
-            match (self.split_dir, dir) {
+            match (sp.split_dir, dir) {
                 (SplitDir::V, Dir::Left) => Some(if cur == 1 { 0 } else { usize::MAX }),
-                (SplitDir::V, Dir::Right) => {
-                    if cur == 0 {
-                        Some(1)
-                    } else {
-                        None
-                    }
-                }
-                (SplitDir::H, Dir::Up) => {
-                    if cur == 1 {
-                        Some(0)
-                    } else {
-                        None
-                    }
-                }
-                (SplitDir::H, Dir::Down) => {
-                    if cur == 0 {
-                        Some(1)
-                    } else {
-                        None
-                    }
-                }
+                (SplitDir::V, Dir::Right) => (cur == 0).then_some(1),
+                (SplitDir::H, Dir::Up) => (cur == 1).then_some(0),
+                (SplitDir::H, Dir::Down) => (cur == 0).then_some(1),
                 (SplitDir::H, Dir::Left) => Some(usize::MAX),
                 _ => None,
             }
         } else {
-            // grid: TL=0 TR=1 BL=2 BR=3
             match dir {
                 Dir::Left => match cur {
                     1 => Some(0),
@@ -763,196 +771,18 @@ impl App {
         };
         match target {
             Some(usize::MAX) => self.focus_sidebar(),
-            Some(p) if p < n => self.active_pane = p,
+            Some(p) if p < n => self.spaces[self.active_space].focused = p,
             _ => {}
         }
     }
 
-    fn pane_tab_cycle(&mut self, d: isize) {
-        let p = &mut self.panes[self.active_pane];
-        let n = p.tabs.len() as isize;
+    fn pane_cycle(&mut self, d: isize) {
+        let sp = &mut self.spaces[self.active_space];
+        let n = sp.chats.len() as isize;
         if n < 2 {
             return;
         }
-        p.active_tab = (p.active_tab as isize + d).rem_euclid(n) as usize;
-    }
-
-    fn split(&mut self, dir: SplitDir) {
-        if self.panes.len() >= 4 {
-            return;
-        }
-        let cur = self.cur_id();
-        self.panes.push(Pane {
-            tabs: vec![cur],
-            active_tab: 0,
-        });
-        if self.panes.len() == 2 {
-            self.split_dir = dir;
-        }
-        self.active_pane = self.panes.len() - 1;
-        self.zoom = false;
-        self.focus = Focus::Main;
-    }
-
-    fn detach_tab(&mut self) {
-        if self.panes.len() >= 4 {
-            return;
-        }
-        let (id, keep) = {
-            let p = &mut self.panes[self.active_pane];
-            if p.tabs.len() <= 1 {
-                return; // nothing to separate
-            }
-            let id = p.tabs.remove(p.active_tab);
-            if p.active_tab >= p.tabs.len() {
-                p.active_tab = p.tabs.len() - 1;
-            }
-            (id, true)
-        };
-        if keep {
-            self.panes.push(Pane {
-                tabs: vec![id],
-                active_tab: 0,
-            });
-            if self.panes.len() == 2 {
-                self.split_dir = SplitDir::V;
-            }
-            self.active_pane = self.panes.len() - 1;
-            self.zoom = false;
-        }
-    }
-
-    fn close_pane(&mut self) {
-        if self.panes.len() <= 1 {
-            return;
-        }
-        self.panes.remove(self.active_pane);
-        if self.active_pane >= self.panes.len() {
-            self.active_pane = self.panes.len() - 1;
-        }
-        self.zoom = false;
-    }
-
-    fn only_pane(&mut self) {
-        let keep = Pane {
-            tabs: self.panes[self.active_pane].tabs.clone(),
-            active_tab: self.panes[self.active_pane].active_tab,
-        };
-        self.panes = vec![keep];
-        self.active_pane = 0;
-        self.zoom = false;
-    }
-
-    /// Add a chat as a new inter-tab in the focused pane (or switch to it if
-    /// already there). This is the `Space s c` merge.
-    fn pane_add_tab(&mut self, id: u64) {
-        let p = &mut self.panes[self.active_pane];
-        if let Some(pos) = p.tabs.iter().position(|&t| t == id) {
-            p.active_tab = pos;
-        } else {
-            p.tabs.push(id);
-            p.active_tab = p.tabs.len() - 1;
-        }
-    }
-
-    /// Open a chat in the focused pane's current tab (replace), or switch if it
-    /// is already a tab there.
-    fn pane_open(&mut self, id: u64) {
-        let p = &mut self.panes[self.active_pane];
-        if let Some(pos) = p.tabs.iter().position(|&t| t == id) {
-            p.active_tab = pos;
-        } else if !p.tabs.is_empty() {
-            let at = p.active_tab.min(p.tabs.len() - 1);
-            p.tabs[at] = id;
-        } else {
-            p.tabs.push(id);
-            p.active_tab = 0;
-        }
-    }
-
-    fn open_selected(&mut self) {
-        if let Some(id) = self.sel_id() {
-            self.pane_open(id);
-            self.focus = Focus::Main;
-        }
-    }
-
-    // ---- picker (Space s c) ----
-
-    fn open_picker(&mut self, action: PickerAction) {
-        self.picker_action = action;
-        self.picker_query.clear();
-        self.picker_sel = 0;
-        self.mode = Mode::Picker;
-    }
-
-    pub fn picker_candidates(&self) -> Vec<usize> {
-        let q = self.picker_query.to_lowercase();
-        self.chats
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| {
-                q.is_empty() || {
-                    let t = if c.title.trim().is_empty() {
-                        "untitled".to_string()
-                    } else {
-                        c.title.to_lowercase()
-                    };
-                    t.contains(&q)
-                }
-            })
-            .map(|(i, _)| i)
-            .collect()
-    }
-
-    fn picker_commit(&mut self) {
-        let cands = self.picker_candidates();
-        let id = if let Some(&ci) = cands.get(self.picker_sel) {
-            // a match is highlighted — use it
-            Some(self.chats[ci].id)
-        } else {
-            // nothing matches the query → auto-create a new chat with that name
-            let q = self.picker_query.trim().to_string();
-            if q.is_empty() {
-                None
-            } else {
-                let id = self.add_chat_to_list();
-                if let Some(i) = self.chat_index(id) {
-                    self.chats[i].title = slug(&q);
-                    self.chats[i].autonamed = true;
-                }
-                Some(id)
-            }
-        };
-        if let Some(id) = id {
-            match self.picker_action {
-                PickerAction::AddTab => self.pane_add_tab(id),
-                PickerAction::OpenHere => self.pane_open(id),
-            }
-            self.focus = Focus::Main;
-        }
-        self.mode = Mode::Normal;
-    }
-
-    // ---- sidebar / jump ----
-
-    fn sidebar_move(&mut self, delta: isize) {
-        let order = self.visible_order();
-        if order.is_empty() {
-            return;
-        }
-        let cur = self.sidebar_cursor.min(order.len() - 1) as isize;
-        let next = (cur + delta).clamp(0, order.len() as isize - 1) as usize;
-        self.sidebar_cursor = next;
-    }
-
-    /// Leader + 1..9,0 → focus space (pane) 0..9.
-    fn leader_jump(&mut self, d: char) {
-        let idx = if d == '0' { 9 } else { (d as u8 - b'1') as usize };
-        if idx < self.panes.len() {
-            self.active_pane = idx;
-            self.focus = Focus::Main;
-        }
+        sp.focused = (sp.fi() as isize + d).rem_euclid(n) as usize;
     }
 
     fn scroll_down(&mut self, n: u16) {
@@ -972,120 +802,118 @@ impl App {
         c.scroll = c.scroll.saturating_sub(n);
     }
 
-    // ---- chat lifecycle ----
+    fn sidebar_move(&mut self, delta: isize) {
+        let n = self.spaces.len();
+        if n == 0 {
+            return;
+        }
+        let cur = self.sidebar_cursor.min(n - 1) as isize;
+        self.sidebar_cursor = (cur + delta).clamp(0, n as isize - 1) as usize;
+    }
 
-    fn add_chat_to_list(&mut self) -> u64 {
-        let id = self.next_id;
-        self.next_id += 1;
-        self.chats.push(Chat::fresh(id));
-        self.sidebar_to(id);
+    fn leader_jump(&mut self, d: char) {
+        let idx = if d == '0' { 9 } else { (d as u8 - b'1') as usize };
+        if idx < self.spaces.len() {
+            self.active_space = idx;
+            self.sidebar_cursor = idx;
+            self.focus = Focus::Main;
+        }
+    }
+
+    // ---- space / chat lifecycle ----
+
+    fn new_space(&mut self) -> usize {
+        let cid = self.next_chat_id;
+        self.next_chat_id += 1;
+        let sid = self.next_space_id;
+        self.next_space_id += 1;
+        self.spaces.push(Space::one(sid, Chat::fresh(cid)));
+        self.active_space = self.spaces.len() - 1;
+        self.sidebar_cursor = self.active_space;
         self.persist();
-        id
+        self.active_space
     }
 
-    fn new_chat(&mut self) {
-        let id = self.add_chat_to_list();
-        self.pane_add_tab(id); // add as a NEW tab in this space (own fresh session)
-        self.focus = Focus::Main;
-        self.mode = Mode::Insert;
-    }
-
-    /// Add a chat and name it inline in the sidebar (focus stays on the sidebar,
-    /// entry is unnamed). Not opened in a pane until you Enter it.
-    fn new_named_chat(&mut self) {
-        self.add_chat_to_list();
+    fn new_named_space(&mut self) {
+        self.new_space();
         self.sidebar_open = true;
         self.focus = Focus::Sidebar;
         self.rename_buf.clear();
         self.mode = Mode::Rename;
     }
 
-    fn rename_start(&mut self) {
-        let id = if self.focus == Focus::Sidebar {
-            self.sel_id()
-        } else {
-            Some(self.cur_id())
-        };
-        let Some(id) = id else {
+    fn add_chat_to_active(&mut self) {
+        if self.spaces[self.active_space].chats.len() >= 4 {
             return;
-        };
-        self.sidebar_open = true;
-        self.focus = Focus::Sidebar;
-        self.sidebar_to(id);
-        let title = self
-            .chat_index(id)
-            .map(|i| self.chats[i].title.clone())
-            .unwrap_or_default();
-        self.rename_buf = title;
-        self.mode = Mode::Rename;
-    }
-
-    fn rename_commit(&mut self) {
-        let Some(id) = self.sel_id() else {
-            self.mode = Mode::Normal;
-            return;
-        };
-        let Some(idx) = self.chat_index(id) else {
-            self.mode = Mode::Normal;
-            return;
-        };
-        let name = self.rename_buf.trim().to_string();
-        if name.is_empty() {
-            let auto = self.chats[idx].transcript.iter().find_map(|e| match e {
-                Entry::User(t) => Some(slug(t)),
-                _ => None,
-            });
-            if let Some(a) = auto {
-                self.chats[idx].title = a;
-                self.chats[idx].autonamed = true;
-            }
-        } else {
-            self.chats[idx].title = name;
-            self.chats[idx].autonamed = true;
         }
-        self.mode = Mode::Normal;
+        let cid = self.next_chat_id;
+        self.next_chat_id += 1;
+        {
+            let sp = &mut self.spaces[self.active_space];
+            sp.chats.push(Chat::fresh(cid));
+            sp.focused = sp.chats.len() - 1;
+            sp.zoom = false;
+        }
+        self.focus = Focus::Main;
+        self.mode = Mode::Insert;
         self.persist();
     }
 
-    fn delete_chat(&mut self, id: u64) {
-        if self.chats.len() <= 1 {
+    fn pop_chat(&mut self) {
+        let ai = self.active_space;
+        if self.spaces[ai].chats.len() <= 1 {
             return;
         }
-        if let Some(ci) = self.chat_index(id) {
-            self.chats.remove(ci);
-        }
-        let mut i = 0;
-        while i < self.panes.len() {
-            let p = &mut self.panes[i];
-            p.tabs.retain(|&t| t != id);
-            if p.active_tab >= p.tabs.len() {
-                p.active_tab = p.tabs.len().saturating_sub(1);
+        let chat = {
+            let sp = &mut self.spaces[ai];
+            let f = sp.fi();
+            let chat = sp.chats.remove(f);
+            if sp.focused >= sp.chats.len() {
+                sp.focused = sp.chats.len() - 1;
             }
-            if p.tabs.is_empty() {
-                self.panes.remove(i);
-            } else {
-                i += 1;
+            sp.zoom = false;
+            chat
+        };
+        let sid = self.next_space_id;
+        self.next_space_id += 1;
+        self.spaces.push(Space::one(sid, chat));
+        self.active_space = self.spaces.len() - 1;
+        self.sidebar_cursor = self.active_space;
+        self.focus = Focus::Main;
+        self.persist();
+    }
+
+    fn close_focused_pane(&mut self) {
+        let ai = self.active_space;
+        if self.spaces[ai].chats.len() <= 1 {
+            self.delete_space_at(ai);
+        } else {
+            let sp = &mut self.spaces[ai];
+            let f = sp.fi();
+            sp.chats.remove(f);
+            if sp.focused >= sp.chats.len() {
+                sp.focused = sp.chats.len() - 1;
             }
-        }
-        if self.panes.is_empty() {
-            let fid = self.chats[0].id;
-            self.panes.push(Pane {
-                tabs: vec![fid],
-                active_tab: 0,
-            });
-        }
-        if self.active_pane >= self.panes.len() {
-            self.active_pane = self.panes.len() - 1;
-        }
-        let order = self.visible_order();
-        if self.sidebar_cursor >= order.len() {
-            self.sidebar_cursor = order.len().saturating_sub(1);
+            sp.zoom = false;
         }
         self.persist();
+    }
+
+    fn delete_space_at(&mut self, i: usize) {
+        if self.spaces.len() <= 1 || i >= self.spaces.len() {
+            return;
+        }
+        self.spaces.remove(i);
+        if self.active_space >= self.spaces.len() {
+            self.active_space = self.spaces.len() - 1;
+        }
+        if self.sidebar_cursor >= self.spaces.len() {
+            self.sidebar_cursor = self.spaces.len() - 1;
+        }
     }
 
     fn toggle_select(&mut self) {
-        if let Some(id) = self.sel_id() {
+        if let Some(id) = self.sel_space_id() {
             if let Some(pos) = self.selected.iter().position(|&x| x == id) {
                 self.selected.remove(pos);
             } else {
@@ -1094,11 +922,79 @@ impl App {
         }
     }
 
-    /// Ask before deleting: the multi-selected chats, else the one under the cursor.
+    /// Merge the selected spaces into the first — chats combined (≤4), sources
+    /// removed. Name defaults to the first space's name.
+    fn merge_selected(&mut self) {
+        if self.selected.len() < 2 {
+            return;
+        }
+        let ids = self.selected.clone();
+        let total: usize = ids
+            .iter()
+            .filter_map(|&id| self.space_index(id))
+            .map(|i| self.spaces[i].chats.len())
+            .sum();
+        if total > 4 {
+            self.cur_chat_mut()
+                .transcript
+                .push(Entry::Note("can't merge — would exceed 4 chats in a space".into()));
+            self.selected.clear();
+            return;
+        }
+        let target_name = self
+            .space_index(ids[0])
+            .map(|i| space_name(&self.spaces[i]))
+            .unwrap_or_default();
+        let mut moved: Vec<Chat> = Vec::new();
+        for &oid in &ids[1..] {
+            if let Some(oi) = self.space_index(oid) {
+                let sp = self.spaces.remove(oi);
+                moved.extend(sp.chats);
+            }
+        }
+        if let Some(ti) = self.space_index(ids[0]) {
+            self.spaces[ti].name = target_name;
+            self.spaces[ti].chats.extend(moved);
+            self.active_space = ti;
+            self.sidebar_cursor = ti;
+        }
+        self.selected.clear();
+        if self.active_space >= self.spaces.len() {
+            self.active_space = self.spaces.len() - 1;
+        }
+        if self.sidebar_cursor >= self.spaces.len() {
+            self.sidebar_cursor = self.spaces.len() - 1;
+        }
+        self.persist();
+    }
+
+    fn merge_space_into_active(&mut self, other_id: u64) {
+        let ai = self.active_space;
+        let a_id = self.spaces[ai].id;
+        if other_id == a_id {
+            return;
+        }
+        let Some(oi) = self.space_index(other_id) else {
+            return;
+        };
+        if self.spaces[ai].chats.len() + self.spaces[oi].chats.len() > 4 {
+            self.cur_chat_mut()
+                .transcript
+                .push(Entry::Note("can't merge — would exceed 4 chats in a space".into()));
+            return;
+        }
+        let sp = self.spaces.remove(oi);
+        let ai2 = self.space_index(a_id).unwrap_or(0);
+        self.spaces[ai2].chats.extend(sp.chats);
+        self.active_space = ai2;
+        self.sidebar_cursor = ai2;
+        self.persist();
+    }
+
     fn request_delete(&mut self) {
         let ids: Vec<u64> = if !self.selected.is_empty() {
             self.selected.clone()
-        } else if let Some(id) = self.sel_id() {
+        } else if let Some(id) = self.sel_space_id() {
             vec![id]
         } else {
             return;
@@ -1106,86 +1002,89 @@ impl App {
         let n = ids.len();
         self.confirm_msg = if n == 1 {
             let name = self
-                .chat_index(ids[0])
-                .map(|i| {
-                    let c = &self.chats[i];
-                    if c.title.trim().is_empty() {
-                        "untitled".to_string()
-                    } else {
-                        c.title.clone()
-                    }
-                })
+                .space_index(ids[0])
+                .map(|i| space_name(&self.spaces[i]))
                 .unwrap_or_default();
-            format!("delete chat \"{name}\"?   y / n")
+            format!("delete space \"{name}\"?   y / n")
         } else {
-            format!("delete {n} chats?   y / n")
+            format!("delete {n} spaces?   y / n")
         };
         self.pending_delete = ids;
         self.mode = Mode::Confirm;
     }
 
-    fn key_confirm(&mut self, k: KeyEvent) {
-        match k.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                let ids = std::mem::take(&mut self.pending_delete);
-                for id in ids {
-                    self.delete_chat(id);
-                }
-                self.selected.clear();
-                self.mode = Mode::Normal;
-            }
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                self.pending_delete.clear();
-                self.mode = Mode::Normal;
-            }
-            _ => {}
-        }
-    }
-
-    /// Vim `{` / `}` over the sidebar: jump to the first item of the prev / next
-    /// qualifier group.
-    fn sidebar_group_jump(&mut self, dir: isize) {
-        let order = self.visible_order();
-        if order.is_empty() {
-            return;
-        }
-        let quals: Vec<Option<String>> =
-            order.iter().map(|&i| self.chats[i].qualifier.clone()).collect();
-        let cur = self.sidebar_cursor.min(order.len() - 1);
-        let cur_q = quals[cur].clone();
-        if dir > 0 {
-            let mut j = cur;
-            while j < order.len() && quals[j] == cur_q {
-                j += 1;
-            }
-            self.sidebar_cursor = if j < order.len() { j } else { order.len() - 1 };
+    fn rename_start(&mut self) {
+        let idx = if self.focus == Focus::Sidebar {
+            self.sidebar_cursor
         } else {
-            let mut start = cur;
-            while start > 0 && quals[start - 1] == cur_q {
-                start -= 1;
-            }
-            if start < cur {
-                self.sidebar_cursor = start;
-            } else if start > 0 {
-                let prev_q = quals[start - 1].clone();
-                let mut ps = start - 1;
-                while ps > 0 && quals[ps - 1] == prev_q {
-                    ps -= 1;
-                }
-                self.sidebar_cursor = ps;
-            } else {
-                self.sidebar_cursor = 0;
-            }
+            self.active_space
         }
+        .min(self.spaces.len().saturating_sub(1));
+        self.sidebar_open = true;
+        self.focus = Focus::Sidebar;
+        self.sidebar_cursor = idx;
+        self.rename_buf = self.spaces[idx].name.clone();
+        self.mode = Mode::Rename;
     }
 
-    fn set_qualifier(&mut self, q: Option<String>) {
-        let id = self.cur_id();
-        if let Some(i) = self.chat_index(id) {
-            self.chats[i].qualifier = q;
-        }
-        self.sidebar_to(id);
+    fn rename_commit(&mut self) {
+        let idx = self.sidebar_cursor.min(self.spaces.len().saturating_sub(1));
+        self.spaces[idx].name = self.rename_buf.trim().to_string();
+        self.mode = Mode::Normal;
         self.persist();
+    }
+
+    // ---- picker (Space s c — merge a space in, or type a new chat name) ----
+
+    fn open_picker(&mut self) {
+        self.picker_query.clear();
+        self.picker_sel = 0;
+        self.mode = Mode::Picker;
+    }
+
+    pub fn picker_candidates(&self) -> Vec<usize> {
+        let q = self.picker_query.to_lowercase();
+        self.spaces
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != self.active_space)
+            .filter(|(_, sp)| q.is_empty() || space_name(sp).to_lowercase().contains(&q))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    fn picker_down(&mut self) {
+        let n = self.picker_candidates().len();
+        if n > 0 {
+            self.picker_sel = (self.picker_sel + 1).min(n - 1);
+        }
+    }
+    fn picker_up(&mut self) {
+        self.picker_sel = self.picker_sel.saturating_sub(1);
+    }
+
+    fn picker_commit(&mut self) {
+        let cands = self.picker_candidates();
+        if let Some(&si) = cands.get(self.picker_sel) {
+            let other = self.spaces[si].id;
+            self.merge_space_into_active(other);
+        } else {
+            // no match → add a new chat named the query to the active space
+            let q = self.picker_query.trim().to_string();
+            if !q.is_empty() && self.spaces[self.active_space].chats.len() < 4 {
+                let cid = self.next_chat_id;
+                self.next_chat_id += 1;
+                let mut c = Chat::fresh(cid);
+                c.title = slug(&q);
+                c.autonamed = true;
+                let sp = &mut self.spaces[self.active_space];
+                sp.chats.push(c);
+                sp.focused = sp.chats.len() - 1;
+                self.persist();
+            }
+        }
+        self.focus = Focus::Main;
+        self.mode = Mode::Normal;
     }
 
     fn exec_command(&mut self) {
@@ -1194,51 +1093,39 @@ impl App {
         self.mode = Mode::Normal;
         match cmd.as_str() {
             "q" | "quit" => self.should_quit = true,
-            "new" => self.new_chat(),
-            "loop" => self.set_qualifier(Some("loop".into())),
-            "agent" => self.set_qualifier(Some("agent".into())),
-            "parallel" => self.set_qualifier(Some("parallel".into())),
-            "solo" | "clear" | "unqualify" => self.set_qualifier(None),
-            "close" => self.delete_chat(self.cur_id()),
-            "vsplit" | "vs" => self.split(SplitDir::V),
-            "split" | "sp" => self.split(SplitDir::H),
-            "only" => self.only_pane(),
+            "new" => {
+                self.new_space();
+                self.mode = Mode::Insert;
+            }
+            "close" => self.close_focused_pane(),
+            "pop" => self.pop_chat(),
+            "vsplit" | "vs" => self.spaces[self.active_space].split_dir = SplitDir::V,
+            "split" | "sp" => self.spaces[self.active_space].split_dir = SplitDir::H,
             "w" | "ws" | "write" => self.persist(),
             _ => {}
         }
     }
 
-    fn env_prompt(&self, idx: usize) -> String {
-        let chat = &self.chats[idx];
+    fn env_prompt(&self) -> String {
         let cwd = std::env::current_dir()
             .map(|p| p.display().to_string())
             .unwrap_or_default();
-        let others: Vec<&str> = self
-            .chats
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| *i != idx)
-            .map(|(_, c)| {
-                if c.title.trim().is_empty() {
-                    "untitled"
-                } else {
-                    c.title.as_str()
+        let cur = self.cur_chat();
+        let mut siblings: Vec<String> = Vec::new();
+        for sp in &self.spaces {
+            for c in &sp.chats {
+                if c.id != cur.id {
+                    siblings.push(chat_title(c));
                 }
-            })
-            .collect();
-        let role = chat
-            .qualifier
-            .as_ref()
-            .map(|q| format!(", acting as a \"{q}\" agent"))
-            .unwrap_or_default();
+            }
+        }
         format!(
             "You are running inside aeovim — a keyboard-driven, multi-agent terminal UI that wraps the Claude Code CLI. \
-You are the agent labelled \"{}\"{}. The user may run several agents in parallel; sibling agents currently open: [{}]. \
+You are the agent labelled \"{}\". The user may run several agents in parallel; sibling agents currently open: [{}]. \
 Agents persist across restarts and (soon) can trigger one another. Working directory: {}. \
 You're in a terminal on macOS (tmux/Ghostty) — keep output concise and terminal-friendly.",
-            if chat.title.trim().is_empty() { "untitled" } else { &chat.title },
-            role,
-            others.join(", "),
+            chat_title(cur),
+            siblings.join(", "),
             cwd
         )
     }
@@ -1248,24 +1135,15 @@ You're in a terminal on macOS (tmux/Ghostty) — keep output concise and termina
         if prompt.is_empty() {
             return;
         }
-        if prompt.starts_with("/loop") {
-            self.set_qualifier(Some("loop".into()));
-            self.cur_chat_mut()
-                .transcript
-                .push(Entry::Note("marked as loop — scheduler coming soon".into()));
-            self.input.clear();
-            self.mode = Mode::Normal;
-            return;
-        }
-
         let dangerous = self.dangerous;
         let model = self.model_cli.clone();
         let tx = self.tx.clone();
-        let idx = self.cur_idx();
-        let sysp = self.env_prompt(idx);
+        let sysp = self.env_prompt();
 
         let spec = {
-            let c = &mut self.chats[idx];
+            let ai = self.active_space;
+            let fi = self.spaces[ai].fi();
+            let c = &mut self.spaces[ai].chats[fi];
             if c.in_flight {
                 return;
             }

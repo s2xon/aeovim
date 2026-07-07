@@ -1,9 +1,6 @@
-//! Session persistence, keyed per tmux session.
-//!
-//! We save lightweight chat metadata (title, qualifier, claude session id, cost)
-//! to `~/.local/state/aeovim/<tmux-session>.json`. On relaunch, chats are
-//! restored and continue via `claude --resume <session-id>`, so the agent
-//! context is intact even though the visible transcript starts fresh.
+//! Persistence, keyed per tmux session. We save spaces (name + their chats'
+//! titles/session ids), so relaunching restores the space layout and each chat
+//! continues via `claude --resume`.
 
 use std::path::PathBuf;
 
@@ -12,11 +9,16 @@ use serde::{Deserialize, Serialize};
 #[derive(Serialize, Deserialize, Clone)]
 pub struct PersistChat {
     pub title: String,
-    #[serde(default)]
-    pub qualifier: Option<String>,
     pub session_id: String,
     #[serde(default)]
     pub cost: f64,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct PersistSpace {
+    #[serde(default)]
+    pub name: String,
+    pub chats: Vec<PersistChat>,
 }
 
 fn state_dir() -> Option<PathBuf> {
@@ -52,17 +54,17 @@ fn file(key: &str) -> Option<PathBuf> {
     Some(state_dir()?.join(format!("{key}.json")))
 }
 
-pub fn load(key: &str) -> Vec<PersistChat> {
+pub fn load(key: &str) -> Vec<PersistSpace> {
     let Some(p) = file(key) else { return vec![] };
     let Ok(data) = std::fs::read_to_string(&p) else { return vec![] };
     serde_json::from_str(&data).unwrap_or_default()
 }
 
-pub fn save(key: &str, chats: &[PersistChat]) {
+pub fn save(key: &str, spaces: &[PersistSpace]) {
     let Some(dir) = state_dir() else { return };
     let _ = std::fs::create_dir_all(&dir);
     if let Some(p) = file(key) {
-        if let Ok(data) = serde_json::to_string_pretty(chats) {
+        if let Ok(data) = serde_json::to_string_pretty(spaces) {
             let _ = std::fs::write(p, data);
         }
     }
