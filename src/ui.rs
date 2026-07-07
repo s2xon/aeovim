@@ -254,7 +254,7 @@ fn render_active_space(f: &mut Frame, region: Rect, app: &mut App) {
 
     if zoom || n == 1 {
         let ci = app.spaces[si].fi();
-        render_chat_body(f, inner, app, si, ci, n > 1);
+        render_chat_body(f, inner, app, si, ci, true);
         return;
     }
     let (panes, dividers) = space_layout(inner, n, dir);

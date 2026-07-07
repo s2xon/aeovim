@@ -169,17 +169,10 @@ pub fn chat_title(c: &Chat) -> String {
 
 /// Display name for a space: its name, else (single chat) the chat's title.
 pub fn space_name(sp: &Space) -> String {
-    // A single-chat space's name IS its chat's name (renaming the chat renames
-    // the entry). Multi-chat spaces use their own name.
-    if sp.chats.len() == 1 {
-        chat_title(&sp.chats[0])
-    } else if !sp.name.trim().is_empty() {
+    if !sp.name.trim().is_empty() {
         sp.name.clone()
     } else {
-        sp.chats
-            .first()
-            .map(chat_title)
-            .unwrap_or_else(|| "space".to_string())
+        "space".to_string()
     }
 }
 
@@ -229,6 +222,7 @@ pub struct App {
     next_chat_id: u64,
     next_space_id: u64,
     chat_counter: u64,
+    space_counter: u64,
     workspace_key: String,
     tx: UnboundedSender<Msg>,
 }
@@ -246,6 +240,7 @@ impl App {
         let mut next_chat_id = 1u64;
         let mut next_space_id = 1u64;
         let chat_counter = 1u64;
+        let space_counter = 1u64;
 
         for ps in &restored {
             let mut chats: Vec<Chat> = Vec::new();
@@ -295,6 +290,7 @@ impl App {
             next_chat_id,
             next_space_id,
             chat_counter,
+            space_counter,
             workspace_key,
             tx,
         }
@@ -880,7 +876,17 @@ impl App {
     fn next_chat_title(&mut self) -> String {
         let n = self.chat_counter;
         self.chat_counter += 1;
-        format!("chat{n}")
+        format!("chat {n}")
+    }
+
+    fn next_space_name(&mut self) -> String {
+        let n = self.space_counter;
+        self.space_counter += 1;
+        if n == 1 {
+            "space".to_string()
+        } else {
+            format!("space {n}")
+        }
     }
 
     fn new_space(&mut self) -> usize {
@@ -889,9 +895,12 @@ impl App {
         let sid = self.next_space_id;
         self.next_space_id += 1;
         let title = self.next_chat_title();
+        let sname = self.next_space_name();
         let mut c = Chat::fresh(cid);
         c.title = title;
-        self.spaces.push(Space::one(sid, c));
+        let mut sp = Space::one(sid, c);
+        sp.name = sname;
+        self.spaces.push(sp);
         self.active_space = self.spaces.len() - 1;
         self.sidebar_cursor = self.active_space;
         self.persist();
@@ -943,7 +952,10 @@ impl App {
         };
         let sid = self.next_space_id;
         self.next_space_id += 1;
-        self.spaces.push(Space::one(sid, chat));
+        let sname = self.next_space_name();
+        let mut sp = Space::one(sid, chat);
+        sp.name = sname;
+        self.spaces.push(sp);
         self.active_space = self.spaces.len() - 1;
         self.sidebar_cursor = self.active_space;
         self.focus = Focus::Main;
@@ -1108,16 +1120,7 @@ impl App {
         match self.rename_target {
             RenameTarget::Space => {
                 let idx = self.sidebar_cursor.min(self.spaces.len().saturating_sub(1));
-                let name = self.rename_buf.trim().to_string();
-                if self.spaces[idx].chats.len() == 1 {
-                    // single-chat space: renaming the entry renames the chat
-                    if !name.is_empty() {
-                        self.spaces[idx].chats[0].title = name;
-                        self.spaces[idx].chats[0].autonamed = true;
-                    }
-                } else {
-                    self.spaces[idx].name = name;
-                }
+                self.spaces[idx].name = self.rename_buf.trim().to_string();
             }
             RenameTarget::Chat => {
                 let ai = self.active_space;
