@@ -266,14 +266,8 @@ impl App {
             });
             next_space_id += 1;
         }
-        if spaces.is_empty() {
-            let mut c = Chat::fresh(next_chat_id);
-            next_chat_id += 1;
-            c.title = format!("chat{chat_counter}");
-            chat_counter += 1;
-            spaces.push(Space::one(next_space_id, c));
-            next_space_id += 1;
-        }
+        // No spaces (deleted-all, or first run) → stay empty and show the
+        // "start a space" state; do not auto-create a default space.
 
         Self {
             mode: Mode::Normal,
