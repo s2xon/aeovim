@@ -54,6 +54,11 @@ fn file(key: &str) -> Option<PathBuf> {
     Some(state_dir()?.join(format!("{key}.json")))
 }
 
+/// FIFO the LLMs write to in order to message another space.
+pub fn pipe_path(key: &str) -> Option<PathBuf> {
+    Some(state_dir()?.join(format!("{key}.pipe")))
+}
+
 pub fn load(key: &str) -> Vec<PersistSpace> {
     let Some(p) = file(key) else { return vec![] };
     let Ok(data) = std::fs::read_to_string(&p) else { return vec![] };

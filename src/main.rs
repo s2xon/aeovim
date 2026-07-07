@@ -87,6 +87,20 @@ async fn main() -> Result<()> {
 
     let (tx, rx) = mpsc::unbounded_channel::<Msg>();
 
+    // Inter-agent pipe: a FIFO the LLMs append JSON lines to, to message another
+    // space (routed to that space's chat, visible in its transcript).
+    let pipe_path = store::pipe_path(&key);
+    if let Some(pp) = pipe_path.clone() {
+        if let Some(dir) = pp.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::remove_file(&pp);
+        let _ = std::process::Command::new("mkfifo").arg(&pp).status();
+        std::env::set_var("AEOVIM_PIPE", &pp);
+        let tx = tx.clone();
+        std::thread::spawn(move || pipe_reader(&pp, tx));
+    }
+
     {
         let tx = tx.clone();
         tokio::spawn(async move {
@@ -115,6 +129,9 @@ async fn main() -> Result<()> {
     let res = run(&mut terminal, &mut app, rx).await;
     app.persist();
 
+    if let Some(pp) = &pipe_path {
+        let _ = std::fs::remove_file(pp);
+    }
     if enhanced {
         let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
     }
@@ -142,6 +159,39 @@ async fn run(
         terminal.draw(|f| ui::render(f, app))?;
     }
     Ok(())
+}
+
+/// Blocking reader for the inter-agent FIFO. Reopens on each writer close.
+fn pipe_reader(path: &std::path::Path, tx: mpsc::UnboundedSender<Msg>) {
+    use std::io::BufRead;
+    loop {
+        match std::fs::File::open(path) {
+            Ok(file) => {
+                for line in std::io::BufReader::new(file).lines() {
+                    let Ok(line) = line else { break };
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                        let s = |k: &str| {
+                            v.get(k)
+                                .and_then(|x| x.as_str())
+                                .unwrap_or("")
+                                .to_string()
+                        };
+                        let (to, from, message) = (s("to"), s("from"), s("message"));
+                        if !to.is_empty() && !message.is_empty() {
+                            if tx.send(Msg::Pipe { to, from, message }).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(500)),
+        }
+    }
 }
 
 fn install_panic_hook() {

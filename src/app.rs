@@ -189,6 +189,7 @@ pub enum Msg {
     Tick,
     Agent { chat: u64, ev: AgentEvent },
     TurnEnded { chat: u64, error: Option<String> },
+    Pipe { to: String, from: String, message: String },
 }
 
 pub struct App {
@@ -350,6 +351,7 @@ impl App {
             Msg::Tick => self.spinner = self.spinner.wrapping_add(1),
             Msg::Input(Event::Key(k)) => self.handle_key(k),
             Msg::Input(_) => {}
+            Msg::Pipe { to, from, message } => self.inject_pipe(to, from, message),
             Msg::Agent { chat, ev } => self.handle_agent(chat, ev),
             Msg::TurnEnded { chat, error } => {
                 if let Some(c) = self.chat_by_id_mut(chat) {
@@ -1106,47 +1108,50 @@ impl App {
         }
     }
 
-    fn env_prompt(&self) -> String {
+    fn env_prompt_for(&self, si: usize, ci: usize) -> String {
         let cwd = std::env::current_dir()
             .map(|p| p.display().to_string())
             .unwrap_or_default();
-        let cur = self.cur_chat();
-        let mut siblings: Vec<String> = Vec::new();
-        for sp in &self.spaces {
-            for c in &sp.chats {
-                if c.id != cur.id {
-                    siblings.push(chat_title(c));
-                }
-            }
-        }
+        let me = chat_title(&self.spaces[si].chats[ci]);
+        let my_space = space_name(&self.spaces[si]);
+        let others: Vec<String> = self
+            .spaces
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != si)
+            .map(|(_, sp)| space_name(sp))
+            .collect();
+        let pipe = std::env::var("AEOVIM_PIPE").ok();
+        let pipe_instr = match &pipe {
+            Some(p) if !others.is_empty() => format!(
+                " You can message another space's agent by appending ONE JSON line to the pipe at {p}, e.g.  echo '{{\"to\":\"<space name>\",\"from\":\"{my_space}\",\"message\":\"...\"}}' >> {p}  — only when you genuinely need to coordinate with another agent. Spaces you can message: [{}].",
+                others.join(", ")
+            ),
+            _ => String::new(),
+        };
         format!(
             "You are running inside aeovim — a keyboard-driven, multi-agent terminal UI that wraps the Claude Code CLI. \
-You are the agent labelled \"{}\". The user may run several agents in parallel; sibling agents currently open: [{}]. \
-Agents persist across restarts and (soon) can trigger one another. Working directory: {}. \
-You're in a terminal on macOS (tmux/Ghostty) — keep output concise and terminal-friendly.",
-            chat_title(cur),
-            siblings.join(", "),
-            cwd
+You are the agent \"{me}\" in the space \"{my_space}\". The user may run several agents in parallel.{pipe_instr} \
+Working directory: {cwd}. You're in a terminal on macOS (tmux/Ghostty) — keep output concise and terminal-friendly."
         )
     }
 
-    fn send_prompt(&mut self) {
-        let prompt = self.input.trim().to_string();
-        if prompt.is_empty() {
+    /// Push a user prompt to a specific chat and spawn its turn.
+    fn spawn_for(&mut self, si: usize, ci: usize, prompt: String) {
+        if si >= self.spaces.len() || ci >= self.spaces[si].chats.len() {
+            return;
+        }
+        if self.spaces[si].chats[ci].in_flight {
             return;
         }
         let dangerous = self.dangerous;
         let model = self.model_cli.clone();
         let tx = self.tx.clone();
-        let sysp = self.env_prompt();
-
+        let sysp = self.env_prompt_for(si, ci);
+        let sname = space_name(&self.spaces[si]);
+        let pipe = std::env::var("AEOVIM_PIPE").ok();
         let spec = {
-            let ai = self.active_space;
-            let fi = self.spaces[ai].fi();
-            let c = &mut self.spaces[ai].chats[fi];
-            if c.in_flight {
-                return;
-            }
+            let c = &mut self.spaces[si].chats[ci];
             c.transcript.push(Entry::User(prompt.clone()));
             c.streaming = None;
             c.in_flight = true;
@@ -1160,13 +1165,57 @@ You're in a terminal on macOS (tmux/Ghostty) — keep output concise and termina
                 dangerous,
                 permission_mode: "acceptEdits".into(),
                 append_system_prompt: Some(sysp),
+                space_name: sname,
+                pipe_path: pipe,
             };
             c.first_turn = false;
             spec
         };
+        spawn_turn(spec, tx);
+        self.persist();
+    }
 
+    fn send_prompt(&mut self) {
+        let prompt = self.input.trim().to_string();
+        if prompt.is_empty() {
+            return;
+        }
+        let ai = self.active_space;
+        let fi = self.spaces[ai].fi();
+        if self.spaces[ai].chats[fi].in_flight {
+            return;
+        }
         self.input.clear();
         self.mode = Mode::Normal;
-        spawn_turn(spec, tx);
+        self.spawn_for(ai, fi, prompt);
+    }
+
+    /// A message arrived over the pipe from another agent — deliver it to the
+    /// named space's focused chat and let that agent respond (shown in the UI).
+    fn inject_pipe(&mut self, to: String, from: String, message: String) {
+        let target = self
+            .spaces
+            .iter()
+            .position(|sp| space_name(sp).eq_ignore_ascii_case(to.trim()));
+        let Some(si) = target else {
+            self.cur_chat_mut()
+                .transcript
+                .push(Entry::Note(format!("pipe: no space named \"{to}\"")));
+            return;
+        };
+        let ci = self.spaces[si].fi();
+        let who = if from.trim().is_empty() {
+            "another agent".to_string()
+        } else {
+            from.trim().to_string()
+        };
+        if self.spaces[si].chats[ci].in_flight {
+            self.spaces[si].chats[ci]
+                .transcript
+                .push(Entry::Note(format!("pipe from {who} (queued — busy): {message}")));
+            return;
+        }
+        let prompt = format!("[message from space \"{who}\" via aeovim pipe]\n{message}");
+        self.spawn_for(si, ci, prompt);
     }
 }

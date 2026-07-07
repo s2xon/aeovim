@@ -26,6 +26,9 @@ pub struct TurnSpec {
     pub permission_mode: String,
     /// Injected via --append-system-prompt so claude knows it runs in aeovim.
     pub append_system_prompt: Option<String>,
+    /// This chat's space name + the inter-agent pipe path (env for the child).
+    pub space_name: String,
+    pub pipe_path: Option<String>,
 }
 
 /// Resolve the claude binary. `Command` execs by PATH lookup and ignores shell
@@ -49,6 +52,10 @@ pub fn spawn_turn(spec: TurnSpec, tx: UnboundedSender<Msg>) {
 
         if let Some(sp) = &spec.append_system_prompt {
             cmd.arg("--append-system-prompt").arg(sp);
+        }
+        cmd.env("AEOVIM_SPACE", &spec.space_name);
+        if let Some(p) = &spec.pipe_path {
+            cmd.env("AEOVIM_PIPE", p);
         }
         if spec.dangerous {
             cmd.arg("--dangerously-skip-permissions");
