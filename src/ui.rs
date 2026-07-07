@@ -330,9 +330,17 @@ fn render_chat_body(f: &mut Frame, rect: Rect, app: &mut App, si: usize, ci: usi
     };
 
     let spin = app.spinner;
-    let lines = build_lines(&app.spaces[si].chats[ci], spin);
-    let total = lines.len();
+    let mut lines = build_lines(&app.spaces[si].chats[ci], spin);
     let h = body.height as usize;
+    lines.push(Line::from("")); // small bottom margin
+    if lines.len() < h {
+        // terminal-style: anchor content to the bottom so the newest activity /
+        // loading is always visible near the bottom, with space above
+        let mut padded: Vec<Line> = vec![Line::from(""); h - lines.len()];
+        padded.append(&mut lines);
+        lines = padded;
+    }
+    let total = lines.len();
     let max_scroll = total.saturating_sub(h);
     app.spaces[si].chats[ci].last_max_scroll = max_scroll as u16;
     let chat = &app.spaces[si].chats[ci];
@@ -361,18 +369,28 @@ fn build_lines(chat: &Chat, spin: usize) -> Vec<Line<'static>> {
     for (i, e) in chat.transcript.iter().enumerate() {
         if i > 0 {
             out.push(Line::from(""));
+            // extra gap before each new turn (a user prompt) so turns group
+            if matches!(e, Entry::User(_)) {
+                out.push(Line::from(""));
+            }
         }
         match e {
             Entry::User(x) => push_block(&mut out, "you", user_lbl, x, body),
             Entry::Assistant(x) => push_block(&mut out, "claude", asst_lbl, x, body),
             Entry::Tool(x) => {
                 for (i, l) in x.split('\n').enumerate() {
-                    let st = if i == 0 {
-                        tool_st.add_modifier(Modifier::BOLD)
+                    if i == 0 {
+                        out.push(Line::from(Span::styled(
+                            format!("  {l}"),
+                            tool_st.add_modifier(Modifier::BOLD),
+                        )));
                     } else {
-                        Style::default().fg(t::DIM)
-                    };
-                    out.push(Line::from(Span::styled(format!("  {l}"), st)));
+                        let prefix = if i == 1 { "  ⎿ " } else { "     " };
+                        out.push(Line::from(Span::styled(
+                            format!("{prefix}{l}"),
+                            Style::default().fg(t::DIM),
+                        )));
+                    }
                 }
             }
             Entry::ToolResult { ok, text } => {
@@ -863,6 +881,7 @@ fn render_whichkey(f: &mut Frame, area: Rect, pending: Pending) {
             "g",
             vec![("g", "top"), ("t", "next pane"), ("T", "prev pane")],
         ),
+        Pending::Z => ("z", vec![("z", "recenter on newest")]),
         Pending::None => return,
     };
 

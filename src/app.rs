@@ -47,6 +47,7 @@ pub enum SplitDir {
 pub enum Pending {
     None,
     G,
+    Z,
     Leader,
     LeaderE,
     LeaderN,
@@ -280,27 +281,34 @@ fn format_tool(name: &str, input: &Value) -> String {
             let new = get("new_string");
             let a = if new.is_empty() { 0 } else { new.lines().count().max(1) };
             let r = if old.is_empty() { 0 } else { old.lines().count().max(1) };
-            format!("⏺ Update({f})\n  +{a} -{r}")
+            let summ = if r == 0 {
+                format!("Added {a} lines")
+            } else if a == 0 {
+                format!("Removed {r} lines")
+            } else {
+                format!("+{a} -{r}")
+            };
+            format!("● Update({f})\n{summ}")
         }
         "Write" | "NotebookEdit" => {
             let f = short_path(get("file_path"));
-            let n = get("content").lines().count();
-            format!("⏺ Write({f})\n  +{n}")
+            let n = get("content").lines().count().max(1);
+            format!("● Write({f})\nAdded {n} lines")
         }
-        "Read" => format!("⏺ Read({})", short_path(get("file_path"))),
-        "Bash" => format!("⏺ Bash({})", truncate_str(get("command"), 64)),
-        "Grep" => format!("⏺ Grep({})", truncate_str(get("pattern"), 48)),
-        "Glob" => format!("⏺ Glob({})", truncate_str(get("pattern"), 48)),
-        "WebSearch" => format!("⏺ Search({})", truncate_str(get("query"), 48)),
-        "WebFetch" => format!("⏺ Fetch({})", truncate_str(get("url"), 56)),
-        "Task" => format!("⏺ Task({})", truncate_str(get("description"), 48)),
+        "Read" => format!("● Read({})", short_path(get("file_path"))),
+        "Bash" => format!("● Bash({})", truncate_str(get("command"), 64)),
+        "Grep" => format!("● Grep({})", truncate_str(get("pattern"), 48)),
+        "Glob" => format!("● Glob({})", truncate_str(get("pattern"), 48)),
+        "WebSearch" => format!("● Search({})", truncate_str(get("query"), 48)),
+        "WebFetch" => format!("● Fetch({})", truncate_str(get("url"), 56)),
+        "Task" => format!("● Task({})", truncate_str(get("description"), 48)),
         "TodoWrite" => format_todos(input),
-        other => format!("⏺ {other}"),
+        other => format!("● {other}"),
     }
 }
 
 fn format_todos(input: &Value) -> String {
-    let mut out = String::from("⏺ Todos");
+    let mut out = String::from("● Todos");
     if let Some(arr) = input.get("todos").and_then(Value::as_array) {
         for t in arr {
             let content = t.get("content").and_then(Value::as_str).unwrap_or("");
@@ -830,6 +838,7 @@ impl App {
             KeyCode::Char('H') => self.pane_cycle(-1),
             KeyCode::Char('L') => self.pane_cycle(1),
             KeyCode::Char('g') => self.pending = Pending::G,
+            KeyCode::Char('z') => self.pending = Pending::Z,
             KeyCode::Char('G') => self.cur_chat_mut().follow = true,
             KeyCode::Char('n') => {
                 self.new_space();
@@ -902,6 +911,13 @@ impl App {
                     KeyCode::Char('t') => self.pane_cycle(1),
                     KeyCode::Char('T') => self.pane_cycle(-1),
                     _ => {}
+                }
+            }
+            Pending::Z => {
+                self.pending = Pending::None;
+                if let KeyCode::Char('z') = k.code {
+                    // recenter on the newest activity (the working line)
+                    self.cur_chat_mut().follow = true;
                 }
             }
             Pending::Leader => match k.code {
