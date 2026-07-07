@@ -74,7 +74,7 @@ fn render_sidebar(f: &mut Frame, area: Rect, app: &App) {
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(border))
         .title(Span::styled(
-            " agents ",
+            " spaces ",
             Style::default().fg(t::PURPLE).add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
@@ -155,7 +155,7 @@ fn render_sidebar(f: &mut Frame, area: Rect, app: &App) {
     }
     if order.is_empty() {
         lines.push(Line::from(Span::styled(
-            "  no agents",
+            "  no spaces",
             Style::default().fg(t::DIM),
         )));
     }
