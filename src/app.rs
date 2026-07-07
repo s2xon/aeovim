@@ -245,7 +245,7 @@ impl App {
         let mut spaces = Vec::new();
         let mut next_chat_id = 1u64;
         let mut next_space_id = 1u64;
-        let mut chat_counter = 1u64;
+        let chat_counter = 1u64;
 
         for ps in &restored {
             let mut chats: Vec<Chat> = Vec::new();
