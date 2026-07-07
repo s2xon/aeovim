@@ -4,7 +4,8 @@
 //! Skeleton model: **one child per turn** (`claude -p "<prompt>" ...`), stdin
 //! nulled so there is no "no stdin data" stall. Turn one uses `--session-id`;
 //! follow-ups use `--resume <id>` to keep conversation context. Permissions
-//! default to `--dangerously-skip-permissions` (see `TurnSpec::dangerous`).
+//! default to `--dangerously-skip-permissions`. Each turn injects an
+//! `--append-system-prompt` describing the aeovim environment.
 
 use std::process::Stdio;
 
@@ -23,6 +24,8 @@ pub struct TurnSpec {
     pub model: Option<String>,
     pub dangerous: bool,
     pub permission_mode: String,
+    /// Injected via --append-system-prompt so claude knows it runs in aeovim.
+    pub append_system_prompt: Option<String>,
 }
 
 /// Resolve the claude binary. `Command` execs by PATH lookup and ignores shell
@@ -44,6 +47,9 @@ pub fn spawn_turn(spec: TurnSpec, tx: UnboundedSender<Msg>) {
             .arg("--verbose") // mandatory with -p + stream-json
             .arg("--include-partial-messages"); // token-level deltas
 
+        if let Some(sp) = &spec.append_system_prompt {
+            cmd.arg("--append-system-prompt").arg(sp);
+        }
         if spec.dangerous {
             cmd.arg("--dangerously-skip-permissions");
         } else {

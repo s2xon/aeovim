@@ -1,21 +1,22 @@
-//! Rendering. Layout: [ sidebar | main( tabline / transcript / composer / status ) ].
-//! The sidebar (toggle: `b`) groups chats into Chats / Parallel / Looping / Previous,
-//! neo-tree style. Aesthetic will later be tuned to match the user's nvim setup.
+//! Rendering, themed with the lilac palette ported from the user's nvim.
+//! Layout: [ sidebar | main( tabline / transcript / composer / status ) ] with a
+//! which-key popup overlay when a leader chord is pending.
 
 use ratatui::layout::{Constraint, Layout, Position, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::app::{App, Chat, ChatKind, Entry, Mode};
+use crate::app::{App, Chat, Entry, Focus, Mode, Pending};
+use crate::theme as t;
 
 const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 pub fn render(f: &mut Frame, app: &mut App) {
     let area = f.area();
     let side_w = if app.sidebar_open {
-        30u16.min(area.width.saturating_sub(20))
+        35u16.min(area.width.saturating_sub(24))
     } else {
         0
     };
@@ -34,112 +35,126 @@ pub fn render(f: &mut Frame, app: &mut App) {
     render_transcript(f, rows[1], app);
     render_composer(f, rows[2], app);
     render_status(f, rows[3], app);
+
+    if app.pending != Pending::None {
+        render_whichkey(f, area, app.pending);
+    }
 }
 
 fn render_sidebar(f: &mut Frame, area: Rect, app: &App) {
+    let focused = app.focus == Focus::Sidebar;
+    let border = if focused { t::PURPLE } else { t::BORDER };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::DarkGray))
+        .border_style(Style::default().fg(border))
         .title(Span::styled(
             " agents ",
-            Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+            Style::default().fg(t::PURPLE).add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
     f.render_widget(block, area);
+    let width = inner.width as usize;
 
+    let order = app.visible_order();
     let mut lines: Vec<Line> = Vec::new();
-    push_section(&mut lines, "CHATS");
-    push_group(&mut lines, app, Some(ChatKind::Solo), false);
-    push_section(&mut lines, "PARALLEL");
-    push_group(&mut lines, app, Some(ChatKind::Parallel), false);
-    push_section(&mut lines, "LOOPING");
-    push_group(&mut lines, app, Some(ChatKind::Loop), false);
-    push_section(&mut lines, "PREVIOUS");
-    push_group(&mut lines, app, None, true);
+    let mut last_qual: Option<Option<String>> = None;
+    let mut idx_in_cat = 0usize;
+
+    for &i in &order {
+        let c = &app.chats[i];
+        let tq = c.qualifier.clone();
+        if last_qual.as_ref() != Some(&tq) {
+            if let Some(q) = &tq {
+                if !lines.is_empty() {
+                    lines.push(Line::from(""));
+                }
+                lines.push(thin_rule(q, width));
+            }
+            last_qual = Some(tq.clone());
+            idx_in_cat = 0;
+        }
+
+        let is_active = i == app.active;
+        let glyph = if c.in_flight {
+            SPIN[app.spinner % SPIN.len()]
+        } else {
+            "●"
+        };
+        let digit = std::char::from_digit(idx_in_cat as u32, 10).unwrap_or(' ');
+        let marker = if is_active { "▸" } else { " " };
+        let fg = if c.in_flight {
+            t::AMBER
+        } else if is_active {
+            if focused {
+                t::PINK
+            } else {
+                t::FG
+            }
+        } else {
+            t::DIM
+        };
+        let mut style = Style::default().fg(fg);
+        if is_active {
+            style = style.add_modifier(Modifier::BOLD);
+            if focused {
+                style = style.bg(t::SELECTION);
+            }
+        }
+        let label = if idx_in_cat < 10 {
+            format!("{marker} {digit} {glyph} {}", c.title)
+        } else {
+            format!("{marker}   {glyph} {}", c.title)
+        };
+        lines.push(Line::from(Span::styled(label, style)));
+        idx_in_cat += 1;
+    }
+    if order.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  no agents",
+            Style::default().fg(t::DIM),
+        )));
+    }
 
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
-fn push_section(lines: &mut Vec<Line>, name: &str) {
-    if !lines.is_empty() {
-        lines.push(Line::from(""));
-    }
-    lines.push(Line::from(Span::styled(
-        format!("▾ {name}"),
-        Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
-    )));
-}
-
-fn push_group(lines: &mut Vec<Line>, app: &App, kind: Option<ChatKind>, closed: bool) {
-    let mut any = false;
-    for (i, c) in app.chats.iter().enumerate() {
-        if c.closed != closed {
-            continue;
-        }
-        if let Some(k) = kind {
-            if c.kind != k {
-                continue;
-            }
-        }
-        any = true;
-        let glyph = if c.in_flight {
-            SPIN[app.spinner % SPIN.len()]
-        } else if closed {
-            "·"
-        } else {
-            "●"
-        };
-        let base = if closed {
-            Style::default().fg(Color::DarkGray)
-        } else if c.in_flight {
-            Style::default().fg(Color::Yellow)
-        } else {
-            Style::default().fg(Color::Gray)
-        };
-        let style = if i == app.active {
-            base.add_modifier(Modifier::REVERSED | Modifier::BOLD)
-        } else {
-            base
-        };
-        lines.push(Line::from(Span::styled(format!("  {glyph} {}", c.title), style)));
-    }
-    if !any {
-        lines.push(Line::from(Span::styled(
-            "  —",
-            Style::default().fg(Color::DarkGray),
-        )));
-    }
+fn thin_rule(name: &str, width: usize) -> Line<'static> {
+    let used = 2 + name.chars().count() + 1;
+    let dashes = width.saturating_sub(used);
+    Line::from(vec![
+        Span::styled("─ ".to_string(), Style::default().fg(t::GUTTER)),
+        Span::styled(
+            name.to_string(),
+            Style::default().fg(t::PERI).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" {}", "─".repeat(dashes)),
+            Style::default().fg(t::GUTTER),
+        ),
+    ])
 }
 
 fn render_tabline(f: &mut Frame, area: Rect, app: &App) {
     let mut spans = vec![
         Span::styled(
             " aeovim ",
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Magenta)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(t::PURPLE).add_modifier(Modifier::BOLD),
         ),
-        Span::raw(" "),
+        Span::styled("│ ", Style::default().fg(t::GUTTER)),
     ];
-    for (i, c) in app.chats.iter().enumerate() {
-        if c.closed {
-            continue;
-        }
+    for (n, &i) in app.visible_order().iter().enumerate() {
+        let c = &app.chats[i];
         let glyph = if c.in_flight {
             SPIN[app.spinner % SPIN.len()]
         } else {
             "●"
         };
-        let label = format!(" {}:{} {glyph} ", i + 1, c.title);
+        let label = format!("{}:{} {glyph}  ", n + 1, c.title);
         let st = if i == app.active {
-            Style::default()
-                .fg(Color::White)
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD)
+            Style::default().fg(t::FG).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(t::DIM)
         };
         spans.push(Span::styled(label, st));
     }
@@ -170,14 +185,12 @@ fn render_transcript(f: &mut Frame, area: Rect, app: &mut App) {
 }
 
 fn build_lines(chat: &Chat, spin: usize) -> Vec<Line<'static>> {
-    let user_lbl = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
-    let asst_lbl = Style::default()
-        .fg(Color::Magenta)
-        .add_modifier(Modifier::BOLD);
-    let tool_st = Style::default().fg(Color::Yellow);
-    let note_st = Style::default().fg(Color::DarkGray);
-    let err_st = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
-    let body = Style::default().fg(Color::Gray);
+    let user_lbl = Style::default().fg(t::PERI).add_modifier(Modifier::BOLD);
+    let asst_lbl = Style::default().fg(t::PURPLE).add_modifier(Modifier::BOLD);
+    let tool_st = Style::default().fg(t::AMBER);
+    let note_st = Style::default().fg(t::DIM);
+    let err_st = Style::default().fg(t::RED).add_modifier(Modifier::BOLD);
+    let body = Style::default().fg(t::FG);
 
     let mut out: Vec<Line> = Vec::new();
     for (i, e) in chat.transcript.iter().enumerate() {
@@ -185,11 +198,11 @@ fn build_lines(chat: &Chat, spin: usize) -> Vec<Line<'static>> {
             out.push(Line::from(""));
         }
         match e {
-            Entry::User(t) => push_block(&mut out, "you", user_lbl, t, body),
-            Entry::Assistant(t) => push_block(&mut out, "claude", asst_lbl, t, body),
+            Entry::User(x) => push_block(&mut out, "you", user_lbl, x, body),
+            Entry::Assistant(x) => push_block(&mut out, "claude", asst_lbl, x, body),
             Entry::Tool(n) => out.push(Line::from(Span::styled(format!("  ⚙ {n}"), tool_st))),
-            Entry::Note(t) => out.push(Line::from(Span::styled(format!("  {t}"), note_st))),
-            Entry::Error(t) => push_block(&mut out, "! error", err_st, t, err_st),
+            Entry::Note(x) => out.push(Line::from(Span::styled(format!("  {x}"), note_st))),
+            Entry::Error(x) => push_block(&mut out, "! error", err_st, x, err_st),
         }
     }
 
@@ -227,60 +240,52 @@ fn push_block(out: &mut Vec<Line<'static>>, label: &str, lbl: Style, text: &str,
 }
 
 fn render_composer(f: &mut Frame, area: Rect, app: &App) {
-    let border = if app.mode == Mode::Insert {
-        Style::default().fg(Color::Green)
-    } else {
-        Style::default().fg(Color::DarkGray)
+    let (accent, title) = match app.mode {
+        Mode::Insert => (t::PINK, " prompt "),
+        Mode::Rename => (t::PURPLE, " rename "),
+        Mode::Command => (t::AMBER, " command "),
+        Mode::Normal => (t::BORDER, " prompt "),
     };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(border)
-        .title(Span::styled(" prompt ", Style::default().fg(Color::DarkGray)));
+        .border_style(Style::default().fg(accent))
+        .title(Span::styled(title, Style::default().fg(t::DIM)));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let content = if app.mode == Mode::Insert {
-        Line::from(vec![
-            Span::styled("❯ ", Style::default().fg(Color::Cyan)),
-            Span::raw(app.input.clone()),
-        ])
-    } else if app.active_chat().in_flight {
+    let (prefix, value): (&str, &str) = match app.mode {
+        Mode::Insert => ("❯ ", app.input.as_str()),
+        Mode::Rename => ("name ❯ ", app.rename_buf.as_str()),
+        Mode::Command => (": ", app.cmd.as_str()),
+        Mode::Normal => ("", ""),
+    };
+    let content = if app.mode == Mode::Normal {
         Line::from(Span::styled(
-            " …working — i to compose next, q to quit",
-            Style::default().fg(Color::DarkGray),
+            " i compose · Space leader · Ctrl-h/l panes · H/L tabs · q quit",
+            Style::default().fg(t::DIM),
         ))
     } else {
-        Line::from(Span::styled(
-            " press i to compose · Enter sends · b sidebar · q quits",
-            Style::default().fg(Color::DarkGray),
-        ))
+        Line::from(vec![
+            Span::styled(prefix.to_string(), Style::default().fg(accent)),
+            Span::styled(value.to_string(), Style::default().fg(t::FG)),
+        ])
     };
     f.render_widget(Paragraph::new(content), inner);
 
-    if app.mode == Mode::Insert {
-        let x = (inner.x + 2 + app.input.chars().count() as u16)
-            .min(inner.x + inner.width.saturating_sub(1));
+    if app.mode != Mode::Normal {
+        let col = prefix.chars().count() + value.chars().count();
+        let x = (inner.x + col as u16).min(inner.x + inner.width.saturating_sub(1));
         f.set_cursor_position(Position::new(x, inner.y));
     }
 }
 
 fn render_status(f: &mut Frame, area: Rect, app: &App) {
-    let (label, chip) = match app.mode {
-        Mode::Normal => (
-            " NORMAL ",
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Blue)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Mode::Insert => (
-            " INSERT ",
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        ),
+    let (label, color) = match app.mode {
+        Mode::Normal => ("NORMAL", t::MODE_NORMAL),
+        Mode::Insert => ("INSERT", t::MODE_INSERT),
+        Mode::Command => ("COMMAND", t::MODE_COMMAND),
+        Mode::Rename => ("RENAME", t::MODE_VISUAL),
     };
     let c = app.active_chat();
     let perm = if app.dangerous {
@@ -298,19 +303,100 @@ fn render_status(f: &mut Frame, area: Rect, app: &App) {
     } else {
         "idle".to_string()
     };
-    let hints = "   b:sidebar n:new Tab:switch x:close i:compose q:quit";
     let line = Line::from(vec![
-        Span::styled(label, chip),
-        Span::styled(mid, Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!(" {label} "),
+            Style::default()
+                .fg(t::PANEL)
+                .bg(color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(mid, Style::default().fg(t::DIM)),
         Span::styled(
             activity,
-            Style::default().fg(if c.in_flight {
-                Color::Yellow
-            } else {
-                Color::DarkGray
-            }),
+            Style::default().fg(if c.in_flight { t::AMBER } else { t::DIM }),
         ),
-        Span::styled(hints, Style::default().fg(Color::DarkGray)),
     ]);
     f.render_widget(Paragraph::new(line), area);
+}
+
+fn render_whichkey(f: &mut Frame, area: Rect, pending: Pending) {
+    let (title, entries): (&str, Vec<(&str, &str)>) = match pending {
+        Pending::Leader => (
+            "leader",
+            vec![
+                ("e", "+explorer"),
+                ("s", "+split"),
+                ("t", "+tab"),
+                ("a", "add + name chat"),
+                ("0-9", "jump to chat N"),
+            ],
+        ),
+        Pending::LeaderE => (
+            "leader e — explorer",
+            vec![
+                ("e", "toggle sidebar"),
+                ("f", "focus sidebar"),
+                ("c", "close sidebar"),
+                ("r", "refresh / save"),
+            ],
+        ),
+        Pending::LeaderS => (
+            "leader s — split",
+            vec![
+                ("v", "vsplit (soon)"),
+                ("h", "hsplit (soon)"),
+                ("m", "zoom (soon)"),
+                ("x", "close pane (soon)"),
+            ],
+        ),
+        Pending::LeaderT => (
+            "leader t — tab",
+            vec![
+                ("o", "new chat"),
+                ("x", "close chat"),
+                ("n", "next chat"),
+                ("p", "prev chat"),
+            ],
+        ),
+        Pending::G => (
+            "g",
+            vec![("g", "top"), ("t", "next chat"), ("T", "prev chat")],
+        ),
+        Pending::None => return,
+    };
+
+    let w = 34u16.min(area.width);
+    let h = (entries.len() as u16 + 2).min(area.height);
+    let rect = Rect {
+        x: area.x + area.width.saturating_sub(w),
+        y: area.y + area.height.saturating_sub(h + 1),
+        width: w,
+        height: h,
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(t::BORDER))
+        .title(Span::styled(
+            format!(" {title} "),
+            Style::default().fg(t::PURPLE).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(rect);
+    f.render_widget(Clear, rect);
+    f.render_widget(block, rect);
+    let lines: Vec<Line> = entries
+        .iter()
+        .map(|(k, d)| {
+            Line::from(vec![
+                Span::styled(
+                    format!(" {k:>3} "),
+                    Style::default().fg(t::PINK).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("→ ", Style::default().fg(t::GUTTER)),
+                Span::styled(d.to_string(), Style::default().fg(t::FG)),
+            ])
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), inner);
 }

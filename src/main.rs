@@ -1,22 +1,28 @@
 //! aeovim — a modal TUI for orchestrating coding agents. Binary: `avim`.
 //!
-//! Walking skeleton: wraps the `claude` CLI over headless stream-json, renders
-//! streamed replies into a multi-chat, sidebar-organized shell. Keybinds are
-//! provisional; the real nvim-mirroring keymap comes later.
+//! Walking skeleton: wraps the `claude` CLI over headless stream-json and renders
+//! streamed replies into a multi-chat, sidebar-organized shell. Keymap + theme
+//! are ported from the user's Neovim config (leader = Space, Ctrl-hjkl panes,
+//! nvim-tree sidebar keys, harpoon number-jump, lilac palette).
 
 mod agent;
 mod app;
 mod protocol;
+mod store;
+mod theme;
 mod ui;
 
 use std::io::stdout;
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::event::EventStream;
+use crossterm::event::{
+    EventStream, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, EnterAlternateScreen,
+    LeaveAlternateScreen,
 };
 use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
@@ -63,14 +69,24 @@ async fn main() -> Result<()> {
         i += 1;
     }
 
+    let key = store::workspace_key();
+    let restored = store::load(&key);
+
     install_panic_hook();
     enable_raw_mode()?;
+    let enhanced = supports_keyboard_enhancement().unwrap_or(false);
     execute!(stdout(), EnterAlternateScreen)?;
+    if enhanced {
+        // Disambiguate Ctrl-h from Backspace etc. (Ghostty/kitty protocol).
+        let _ = execute!(
+            stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        );
+    }
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
 
     let (tx, rx) = mpsc::unbounded_channel::<Msg>();
 
-    // Terminal input -> messages.
     {
         let tx = tx.clone();
         tokio::spawn(async move {
@@ -82,7 +98,6 @@ async fn main() -> Result<()> {
             }
         });
     }
-    // Spinner tick.
     {
         let tx = tx.clone();
         tokio::spawn(async move {
@@ -96,9 +111,13 @@ async fn main() -> Result<()> {
         });
     }
 
-    let mut app = App::new(model_cli, dangerous, tx.clone());
+    let mut app = App::new(model_cli, dangerous, tx.clone(), key, restored);
     let res = run(&mut terminal, &mut app, rx).await;
+    app.persist();
 
+    if enhanced {
+        let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
+    }
     disable_raw_mode().ok();
     execute!(terminal.backend_mut(), LeaveAlternateScreen).ok();
     terminal.show_cursor().ok();
@@ -117,7 +136,6 @@ async fn run(
         if app.should_quit {
             break;
         }
-        // On a bare tick, only redraw if something is streaming (keeps it idle-quiet).
         if is_tick && !app.chats.iter().any(|c| c.in_flight) {
             continue;
         }
@@ -129,6 +147,7 @@ async fn run(
 fn install_panic_hook() {
     let orig = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
         let _ = disable_raw_mode();
         let _ = execute!(stdout(), LeaveAlternateScreen);
         orig(info);
@@ -143,12 +162,12 @@ fn print_help() {
     println!("  avim --replay <stream-json-file>   # debug: dump parsed events\n");
     println!("PERMISSIONS: dangerous by default (--dangerously-skip-permissions).");
     println!("             pass --safe to use --permission-mode acceptEdits.\n");
-    println!("KEYS (provisional — the real keymap comes later):");
-    println!("  i          compose a prompt        Esc   back to normal");
-    println!("  Enter      send                    q     quit");
-    println!("  b          toggle sidebar          n     new chat");
-    println!("  p / l      new parallel / loop chat");
-    println!("  Tab/S-Tab  next / prev chat        gt/gT same");
-    println!("  x          close chat -> Previous");
-    println!("  j/k        scroll   C-d/C-u half page   gg/G top/bottom");
+    println!("KEYS (ported from your nvim; leader = Space):");
+    println!("  i / Esc          compose / normal        Enter  send (in composer)");
+    println!("  Ctrl-h/l         focus sidebar / chat     H / L  prev / next chat");
+    println!("  Space 0-9        jump to chat N in group  Space e e  toggle sidebar");
+    println!("  (in sidebar) j/k move   a add+name   r rename   d close   Enter open");
+    println!("  Space t o/x/n/p  new/close/next/prev chat");
+    println!("  Space s ...      splits (coming next)     : command   q quit");
+    println!("  sessions persist per tmux session — relaunch avim to resume");
 }
