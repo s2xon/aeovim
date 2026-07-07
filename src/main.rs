@@ -165,6 +165,7 @@ fn print_help() {
     println!("KEYS (ported from your nvim; leader = Space):");
     println!("  i / Esc          compose / normal        Enter  send (in composer)");
     println!("  Ctrl-h/l         focus sidebar / chat     H / L  prev / next chat");
+    println!("  Space b          toggle sidebar + focus   Space zz   help / cheatsheet");
     println!("  Space 0-9        jump to chat N in group  Space e e  toggle sidebar");
     println!("  (in sidebar) j/k move   a add+name   r rename   d close   Enter open");
     println!("  Space t o/x/n/p  new/close/next/prev chat");

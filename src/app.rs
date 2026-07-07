@@ -33,6 +33,7 @@ pub enum Pending {
     LeaderE,
     LeaderS,
     LeaderT,
+    LeaderZ,
 }
 
 pub enum Entry {
@@ -60,13 +61,13 @@ pub struct Chat {
 }
 
 impl Chat {
-    fn fresh(id: u64, title: String) -> Self {
+    fn fresh(id: u64) -> Self {
         let session_id = Uuid::new_v4().to_string();
         let mut transcript = Vec::new();
         transcript.push(Entry::Note(format!("session {}", &session_id[..8])));
         Chat {
             id,
-            title,
+            title: String::new(), // unnamed until named or auto-named after first turn
             qualifier: None,
             autonamed: false,
             transcript,
@@ -148,6 +149,7 @@ pub struct App {
     pub dangerous: bool,
     pub should_quit: bool,
     pub spinner: usize,
+    pub help_open: bool,
     next_id: u64,
     workspace_key: String,
     tx: UnboundedSender<Msg>,
@@ -165,7 +167,7 @@ impl App {
         let mut chats = Vec::new();
         let mut next_id = 1u64;
         if restored.is_empty() {
-            chats.push(Chat::fresh(next_id, "chat 1".into()));
+            chats.push(Chat::fresh(next_id));
             next_id += 1;
         } else {
             for pc in restored {
@@ -189,6 +191,7 @@ impl App {
             dangerous,
             should_quit: false,
             spinner: 0,
+            help_open: false,
             next_id,
             workspace_key,
             tx,
@@ -352,6 +355,10 @@ impl App {
         if k.kind == KeyEventKind::Release {
             return;
         }
+        if self.help_open {
+            self.help_open = false; // any key dismisses the cheatsheet
+            return;
+        }
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         match self.mode {
             Mode::Command => match k.code {
@@ -476,6 +483,11 @@ impl App {
                 }
             }
             Pending::Leader => match k.code {
+                KeyCode::Char('b') => {
+                    self.pending = Pending::None;
+                    self.toggle_sidebar();
+                }
+                KeyCode::Char('z') => self.pending = Pending::LeaderZ,
                 KeyCode::Char('e') => self.pending = Pending::LeaderE,
                 KeyCode::Char('s') => self.pending = Pending::LeaderS,
                 KeyCode::Char('t') => self.pending = Pending::LeaderT,
@@ -521,6 +533,12 @@ impl App {
                     KeyCode::Char('n') => self.cycle(1),
                     KeyCode::Char('p') => self.cycle(-1),
                     _ => {}
+                }
+            }
+            Pending::LeaderZ => {
+                self.pending = Pending::None;
+                if let KeyCode::Char('z') = k.code {
+                    self.help_open = true;
                 }
             }
             Pending::None => {}
@@ -581,24 +599,44 @@ impl App {
         c.scroll = c.scroll.saturating_sub(n);
     }
 
-    fn new_chat(&mut self) {
+    fn create_chat(&mut self) {
         let id = self.next_id;
         self.next_id += 1;
-        let n = self.chats.len() + 1;
-        self.chats.push(Chat::fresh(id, format!("chat {n}")));
+        self.chats.push(Chat::fresh(id));
         self.active = self.chats.len() - 1;
-        self.focus = Focus::Main;
         self.sync_cursor();
         self.persist();
     }
 
+    fn new_chat(&mut self) {
+        self.create_chat();
+        self.focus = Focus::Main;
+    }
+
+    /// Add a chat and name it in the sidebar: focus stays on the sidebar, the
+    /// new (unnamed) entry is highlighted and prompts inline for a name.
     fn new_named_chat(&mut self) {
-        self.new_chat();
+        self.create_chat();
+        self.sidebar_open = true;
+        self.focus = Focus::Sidebar;
         self.rename_buf.clear();
         self.mode = Mode::Rename;
     }
 
+    /// Space b: toggle the sidebar and move focus with it.
+    fn toggle_sidebar(&mut self) {
+        self.sidebar_open = !self.sidebar_open;
+        if self.sidebar_open {
+            self.focus = Focus::Sidebar;
+            self.sync_cursor();
+        } else {
+            self.focus = Focus::Main;
+        }
+    }
+
     fn rename_start(&mut self) {
+        self.sidebar_open = true;
+        self.focus = Focus::Sidebar;
         self.rename_buf = self.chats[self.active].title.clone();
         self.mode = Mode::Rename;
     }
@@ -606,7 +644,8 @@ impl App {
     fn rename_commit(&mut self) {
         let name = self.rename_buf.trim().to_string();
         if name.is_empty() {
-            // auto-name from first prompt, else keep placeholder
+            // No name: use the first prompt if any, else leave it unnamed so it
+            // auto-names after the first turn.
             let auto = self.chats[self.active]
                 .transcript
                 .iter()
@@ -616,11 +655,12 @@ impl App {
                 });
             if let Some(a) = auto {
                 self.chats[self.active].title = a;
+                self.chats[self.active].autonamed = true;
             }
         } else {
             self.chats[self.active].title = name;
+            self.chats[self.active].autonamed = true;
         }
-        self.chats[self.active].autonamed = true;
         self.mode = Mode::Normal;
         self.persist();
     }

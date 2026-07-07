@@ -1,6 +1,7 @@
 //! Rendering, themed with the lilac palette ported from the user's nvim.
 //! Layout: [ sidebar | main( tabline / transcript / composer / status ) ] with a
-//! which-key popup overlay when a leader chord is pending.
+//! which-key popup overlay for pending leader chords, and a full cheatsheet
+//! popup (Space z z).
 
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
@@ -12,6 +13,14 @@ use crate::app::{App, Chat, Entry, Focus, Mode, Pending};
 use crate::theme as t;
 
 const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+fn title_of(c: &Chat) -> String {
+    if c.title.trim().is_empty() {
+        "untitled".to_string()
+    } else {
+        c.title.clone()
+    }
+}
 
 pub fn render(f: &mut Frame, app: &mut App) {
     let area = f.area();
@@ -36,7 +45,9 @@ pub fn render(f: &mut Frame, app: &mut App) {
     render_composer(f, rows[2], app);
     render_status(f, rows[3], app);
 
-    if app.pending != Pending::None {
+    if app.help_open {
+        render_help(f, area);
+    } else if app.pending != Pending::None {
         render_whichkey(f, area, app.pending);
     }
 }
@@ -76,6 +87,7 @@ fn render_sidebar(f: &mut Frame, area: Rect, app: &App) {
         }
 
         let is_active = i == app.active;
+        let editing = app.mode == Mode::Rename && is_active;
         let glyph = if c.in_flight {
             SPIN[app.spinner % SPIN.len()]
         } else {
@@ -83,7 +95,8 @@ fn render_sidebar(f: &mut Frame, area: Rect, app: &App) {
         };
         let digit = std::char::from_digit(idx_in_cat as u32, 10).unwrap_or(' ');
         let marker = if is_active { "▸" } else { " " };
-        let fg = if c.in_flight {
+
+        let mut style = Style::default().fg(if c.in_flight {
             t::AMBER
         } else if is_active {
             if focused {
@@ -93,18 +106,29 @@ fn render_sidebar(f: &mut Frame, area: Rect, app: &App) {
             }
         } else {
             t::DIM
-        };
-        let mut style = Style::default().fg(fg);
+        });
         if is_active {
             style = style.add_modifier(Modifier::BOLD);
             if focused {
                 style = style.bg(t::SELECTION);
             }
         }
-        let label = if idx_in_cat < 10 {
-            format!("{marker} {digit} {glyph} {}", c.title)
+        if editing {
+            style = Style::default()
+                .fg(t::PINK)
+                .bg(t::SELECTION)
+                .add_modifier(Modifier::BOLD);
+        }
+
+        let name = if editing {
+            format!("{}▌", app.rename_buf)
         } else {
-            format!("{marker}   {glyph} {}", c.title)
+            title_of(c)
+        };
+        let label = if idx_in_cat < 10 {
+            format!("{marker} {digit} {glyph} {name}")
+        } else {
+            format!("{marker}   {glyph} {name}")
         };
         lines.push(Line::from(Span::styled(label, style)));
         idx_in_cat += 1;
@@ -150,7 +174,7 @@ fn render_tabline(f: &mut Frame, area: Rect, app: &App) {
         } else {
             "●"
         };
-        let label = format!("{}:{} {glyph}  ", n + 1, c.title);
+        let label = format!("{}:{} {glyph}  ", n + 1, title_of(c));
         let st = if i == app.active {
             Style::default().fg(t::FG).add_modifier(Modifier::BOLD)
         } else {
@@ -254,27 +278,34 @@ fn render_composer(f: &mut Frame, area: Rect, app: &App) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let (prefix, value): (&str, &str) = match app.mode {
-        Mode::Insert => ("❯ ", app.input.as_str()),
-        Mode::Rename => ("name ❯ ", app.rename_buf.as_str()),
-        Mode::Command => (": ", app.cmd.as_str()),
-        Mode::Normal => ("", ""),
-    };
-    let content = if app.mode == Mode::Normal {
-        Line::from(Span::styled(
-            " i compose · Space leader · Ctrl-h/l panes · H/L tabs · q quit",
+    let content = match app.mode {
+        Mode::Normal => Line::from(Span::styled(
+            " i compose · Space leader · Space zz help · Ctrl-h/l panes · q quit",
             Style::default().fg(t::DIM),
-        ))
-    } else {
-        Line::from(vec![
-            Span::styled(prefix.to_string(), Style::default().fg(accent)),
-            Span::styled(value.to_string(), Style::default().fg(t::FG)),
-        ])
+        )),
+        Mode::Rename => Line::from(Span::styled(
+            " naming in sidebar — type a name · Enter confirm · Esc cancel",
+            Style::default().fg(t::DIM),
+        )),
+        Mode::Insert => Line::from(vec![
+            Span::styled("❯ ".to_string(), Style::default().fg(accent)),
+            Span::styled(app.input.clone(), Style::default().fg(t::FG)),
+        ]),
+        Mode::Command => Line::from(vec![
+            Span::styled(": ".to_string(), Style::default().fg(accent)),
+            Span::styled(app.cmd.clone(), Style::default().fg(t::FG)),
+        ]),
     };
     f.render_widget(Paragraph::new(content), inner);
 
-    if app.mode != Mode::Normal {
-        let col = prefix.chars().count() + value.chars().count();
+    // Real terminal cursor for the composer inputs; rename edits inline in the
+    // sidebar instead (its own ▌).
+    let cursor_col = match app.mode {
+        Mode::Insert => Some(2 + app.input.chars().count()),
+        Mode::Command => Some(2 + app.cmd.chars().count()),
+        _ => None,
+    };
+    if let Some(col) = cursor_col {
         let x = (inner.x + col as u16).min(inner.x + inner.width.saturating_sub(1));
         f.set_cursor_position(Position::new(x, inner.y));
     }
@@ -325,6 +356,8 @@ fn render_whichkey(f: &mut Frame, area: Rect, pending: Pending) {
         Pending::Leader => (
             "leader",
             vec![
+                ("b", "toggle sidebar + focus"),
+                ("z z", "help / all keybinds"),
                 ("e", "+explorer"),
                 ("s", "+split"),
                 ("t", "+tab"),
@@ -359,6 +392,7 @@ fn render_whichkey(f: &mut Frame, area: Rect, pending: Pending) {
                 ("p", "prev chat"),
             ],
         ),
+        Pending::LeaderZ => ("leader z", vec![("z", "help / all keybinds")]),
         Pending::G => (
             "g",
             vec![("g", "top"), ("t", "next chat"), ("T", "prev chat")],
@@ -399,4 +433,86 @@ fn render_whichkey(f: &mut Frame, area: Rect, pending: Pending) {
         })
         .collect();
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn render_help(f: &mut Frame, area: Rect) {
+    // Sections of (key, description). "" key = section header.
+    let rows: &[(&str, &str)] = &[
+        ("", "MODES"),
+        ("i", "compose a prompt (insert)"),
+        ("Esc", "back to normal"),
+        ("Enter", "send prompt / open chat"),
+        (":", "command line (:new :loop :agent :q)"),
+        ("", "PANES & FOCUS"),
+        ("Ctrl-h / Ctrl-l", "focus sidebar / chat pane"),
+        ("h / l", "focus sidebar / chat (at edges)"),
+        ("Space b", "toggle sidebar + focus it"),
+        ("Ctrl-e", "focus sidebar (quick menu)"),
+        ("", "CHATS"),
+        ("H / L", "prev / next chat"),
+        ("Tab / S-Tab", "cycle chats"),
+        ("Space 0-9", "jump to chat N in current group"),
+        ("n", "new chat + compose"),
+        ("", "SIDEBAR (when focused)"),
+        ("j / k", "move down / up (live-switch)"),
+        ("a", "add chat + name it inline"),
+        ("r", "rename chat"),
+        ("d", "close chat"),
+        ("", "SCROLL"),
+        ("j / k", "line down / up"),
+        ("Ctrl-d / Ctrl-u", "half page"),
+        ("gg / G", "top / bottom (follow)"),
+        ("", "LEADER (Space)"),
+        ("Space e e/f/c", "sidebar toggle / focus / close"),
+        ("Space t o/x/n/p", "new / close / next / prev chat"),
+        ("Space s ...", "splits (coming next)"),
+        ("Space a", "add + name chat"),
+        ("Space z z", "this help"),
+        ("", "MISC"),
+        ("q", "quit    ·  /loop <x>  tag chat as loop"),
+    ];
+
+    let w = 60u16.min(area.width.saturating_sub(2));
+    let h = (rows.len() as u16 + 2).min(area.height.saturating_sub(2));
+    let rect = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(t::PURPLE))
+        .title(Span::styled(
+            " aeovim — keybinds  (any key to close) ",
+            Style::default().fg(t::PURPLE).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(rect);
+    f.render_widget(Clear, rect);
+    f.render_widget(block, rect);
+
+    let lines: Vec<Line> = rows
+        .iter()
+        .map(|(k, d)| {
+            if k.is_empty() {
+                Line::from(Span::styled(
+                    format!(" {d}"),
+                    Style::default().fg(t::PERI).add_modifier(Modifier::BOLD),
+                ))
+            } else {
+                Line::from(vec![
+                    Span::styled(
+                        format!(" {k:>16}  "),
+                        Style::default().fg(t::PINK).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(d.to_string(), Style::default().fg(t::FG)),
+                ])
+            }
+        })
+        .collect();
+    f.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        inner,
+    );
 }
