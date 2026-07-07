@@ -614,8 +614,8 @@ impl App {
                     self.scroll_up(1)
                 }
             }
-            KeyCode::Char('h') | KeyCode::Left => self.focus_dir(Dir::Left),
-            KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => {
+            KeyCode::Left => self.focus_dir(Dir::Left),
+            KeyCode::Right | KeyCode::Enter => {
                 if self.focus == Focus::Sidebar {
                     self.activate_selected()
                 } else {

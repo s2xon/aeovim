@@ -592,7 +592,7 @@ fn render_help(f: &mut Frame, area: Rect) {
         (":", "command (:new :pop :vsplit :q)"),
         ("", "SPACES (sidebar)"),
         ("j / k", "move  ·  { / }  jump 5"),
-        ("Enter / l", "activate space (show it)"),
+        ("Enter", "activate space (show it)"),
         ("Space 1-0", "focus space N"),
         ("a", "new space + name it"),
         ("r", "rename space"),
