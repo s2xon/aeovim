@@ -203,8 +203,49 @@ fn short_path(p: &str) -> String {
     p.rsplit('/').next().unwrap_or(p).to_string()
 }
 
+/// Strip ANSI/OSC escape sequences and other control chars so no raw escapes
+/// ever reach the ratatui cell buffer (they'd otherwise be re-interpreted by the
+/// terminal and corrupt neighbouring panes). Tabs → space.
+pub fn clean_line(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        match c {
+            '\u{1b}' => match it.peek() {
+                Some('[') => {
+                    it.next();
+                    // CSI: consume until a final byte 0x40..=0x7e
+                    while let Some(&n) = it.peek() {
+                        it.next();
+                        if ('\u{40}'..='\u{7e}').contains(&n) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    it.next();
+                    // OSC: consume until BEL or ESC
+                    while let Some(&n) = it.peek() {
+                        it.next();
+                        if n == '\u{07}' || n == '\u{1b}' {
+                            break;
+                        }
+                    }
+                }
+                _ => {
+                    it.next();
+                }
+            },
+            '\t' => out.push(' '),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn truncate_str(s: &str, n: usize) -> String {
-    let one = s.replace('\n', " ");
+    let one = clean_line(&s.replace('\n', " "));
     if one.chars().count() > n {
         format!("{}…", one.chars().take(n).collect::<String>())
     } else {
@@ -212,12 +253,20 @@ fn truncate_str(s: &str, n: usize) -> String {
     }
 }
 
-fn truncate_lines(s: &str, n: usize) -> String {
-    let lines: Vec<&str> = s.lines().collect();
-    if lines.len() > n {
-        format!("{}\n… (+{} lines)", lines[..n].join("\n"), lines.len() - n)
+/// Compact a tool result to one clean line (+N lines) for the transcript.
+fn tool_result_summary(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let first = lines
+        .iter()
+        .find(|l| !l.trim().is_empty())
+        .copied()
+        .unwrap_or("");
+    let clean = truncate_str(first, 72);
+    let extra = lines.len().saturating_sub(1);
+    if extra > 0 {
+        format!("{clean}  (+{extra} lines)")
     } else {
-        s.trim_end().to_string()
+        clean
     }
 }
 
@@ -491,9 +540,9 @@ impl App {
                     c.follow = true;
                 }
                 AgentEvent::ToolResult { ok, text } => {
-                    let t = truncate_lines(&text, 6);
-                    if !t.trim().is_empty() {
-                        c.transcript.push(Entry::ToolResult { ok, text: t });
+                    let summary = tool_result_summary(&text);
+                    if !summary.is_empty() {
+                        c.transcript.push(Entry::ToolResult { ok, text: summary });
                         c.follow = true;
                     }
                 }

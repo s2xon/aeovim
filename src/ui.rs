@@ -95,7 +95,18 @@ fn render_sidebar(f: &mut Frame, area: Rect, app: &App) {
             app.mode == Mode::Rename && is_cursor && app.rename_target == RenameTarget::Space;
         let inflight = sp.chats.iter().any(|c| c.in_flight);
 
-        let glyph = if is_selected { "✓" } else { "●" };
+        let glyph = if is_selected {
+            "✓"
+        } else if inflight {
+            // running: flash filled ↔ hollow circle (no colour change)
+            if (app.spinner / 4) % 2 == 0 {
+                "●"
+            } else {
+                "○"
+            }
+        } else {
+            "●"
+        };
         let marker = if is_active {
             "▸"
         } else if is_cursor {
@@ -105,8 +116,6 @@ fn render_sidebar(f: &mut Frame, area: Rect, app: &App) {
         };
         let fg = if is_selected {
             t::PINK
-        } else if inflight {
-            if (app.spinner / 4) % 2 == 0 { t::AMBER } else { t::DIM }
         } else if is_active {
             t::FG
         } else {
@@ -298,17 +307,8 @@ fn render_active_space(f: &mut Frame, region: Rect, app: &mut App) {
 fn render_chat_body(f: &mut Frame, rect: Rect, app: &mut App, si: usize, ci: usize, header: bool) {
     let is_focus = app.focus == Focus::Main && ci == app.spaces[si].fi();
     let body = if header {
-        let (name, inflight) = {
-            let c = &app.spaces[si].chats[ci];
-            (chat_title(c), c.in_flight)
-        };
-        let dot_col = if inflight {
-            if (app.spinner / 4) % 2 == 0 { t::AMBER } else { t::DIM }
-        } else if is_focus {
-            t::PURPLE
-        } else {
-            t::DIM
-        };
+        let name = chat_title(&app.spaces[si].chats[ci]);
+        let dot_col = if is_focus { t::PURPLE } else { t::DIM };
         let glyph = "●";
         let marker = if is_focus { "▸" } else { " " };
         let hdr = Line::from(vec![
@@ -484,6 +484,8 @@ fn md_spans(text: &str, base: Style) -> Vec<Span<'static>> {
 
 /// A transcript body line: indent prefix + markdown (headers rendered bold).
 fn md_line(prefix: &str, text: &str, base: Style) -> Line<'static> {
+    let cleaned = crate::app::clean_line(text);
+    let text = cleaned.as_str();
     let trimmed = text.trim_start();
     let header = trimmed
         .strip_prefix("### ")
@@ -583,7 +585,7 @@ fn push_block(out: &mut Vec<Line<'static>>, label: &str, lbl: Style, text: &str,
         }
         if in_fence {
             out.push(Line::from(Span::styled(
-                format!("  {l}"),
+                format!("  {}", crate::app::clean_line(l)),
                 Style::default().fg(t::PERI),
             )));
         } else {
@@ -707,9 +709,8 @@ fn render_status(f: &mut Frame, area: Rect, app: &App) {
 
     // right: activity — flashing dot, not a spinner (the one spinner is in the body)
     let right = if c.in_flight {
-        let col = if (app.spinner / 4) % 2 == 0 { t::AMBER } else { t::DIM };
         Line::from(vec![
-            Span::styled("● ", Style::default().fg(col)),
+            Span::styled("● ", Style::default().fg(t::AMBER)),
             Span::styled("working ", Style::default().fg(t::DIM)),
         ])
     } else {
