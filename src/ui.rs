@@ -808,13 +808,26 @@ fn render_whichkey(f: &mut Frame, area: Rect, pending: Pending) {
         Pending::Leader => (
             "leader",
             vec![
-                ("e", "toggle sidebar"),
+                ("e", "+explorer (sidebar)"),
                 ("z z", "help / all keybinds"),
+                ("n", "+new (chat / space)"),
                 ("s", "+space (panes)"),
                 ("t", "+tab"),
                 ("a", "new space + name"),
                 ("1-0", "focus space N"),
             ],
+        ),
+        Pending::LeaderE => (
+            "leader e — explorer",
+            vec![
+                ("e", "toggle sidebar"),
+                ("f", "focus sidebar"),
+                ("c", "close sidebar"),
+            ],
+        ),
+        Pending::LeaderN => (
+            "leader n — new",
+            vec![("c", "new chat (tab in space)"), ("s", "new space")],
         ),
         Pending::LeaderS => (
             "leader s — space",

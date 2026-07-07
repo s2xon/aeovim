@@ -46,6 +46,8 @@ pub enum Pending {
     None,
     G,
     Leader,
+    LeaderE,
+    LeaderN,
     LeaderS,
     LeaderT,
     LeaderZ,
@@ -775,11 +777,9 @@ impl App {
                 }
             }
             Pending::Leader => match k.code {
-                KeyCode::Char('e') => {
-                    self.pending = Pending::None;
-                    self.toggle_sidebar();
-                }
+                KeyCode::Char('e') => self.pending = Pending::LeaderE,
                 KeyCode::Char('z') => self.pending = Pending::LeaderZ,
+                KeyCode::Char('n') => self.pending = Pending::LeaderN,
                 KeyCode::Char('s') => self.pending = Pending::LeaderS,
                 KeyCode::Char('t') => self.pending = Pending::LeaderT,
                 KeyCode::Char('a') => {
@@ -820,6 +820,26 @@ impl App {
                     _ => {}
                 }
             }
+            Pending::LeaderE => {
+                self.pending = Pending::None;
+                match k.code {
+                    KeyCode::Char('e') => self.toggle_sidebar(),
+                    KeyCode::Char('f') => self.focus_sidebar(),
+                    KeyCode::Char('c') => {
+                        self.sidebar_open = false;
+                        self.focus = Focus::Main;
+                    }
+                    _ => {}
+                }
+            }
+            Pending::LeaderN => {
+                self.pending = Pending::None;
+                match k.code {
+                    KeyCode::Char('c') => self.add_chat_to_active(),
+                    KeyCode::Char('s') => self.new_space(),
+                    _ => {}
+                }
+            }
             Pending::LeaderZ => {
                 self.pending = Pending::None;
                 if let KeyCode::Char('z') = k.code {
@@ -838,12 +858,10 @@ impl App {
         self.sidebar_cursor = self.active_space;
     }
 
+    /// Space e e: toggle sidebar visibility (Space e f focuses it).
     fn toggle_sidebar(&mut self) {
         self.sidebar_open = !self.sidebar_open;
-        if self.sidebar_open {
-            self.focus = Focus::Sidebar;
-            self.sidebar_cursor = self.active_space;
-        } else {
+        if !self.sidebar_open && self.focus == Focus::Sidebar {
             self.focus = Focus::Main;
         }
     }
