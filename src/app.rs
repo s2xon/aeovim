@@ -1196,6 +1196,12 @@ Working directory: {cwd}. You're in a terminal on macOS (tmux/Ghostty) — keep 
         if self.spaces[ai].chats[fi].in_flight {
             return;
         }
+        // Name the chat instantly from the first prompt — a local text slug, no
+        // claude call involved.
+        if !self.spaces[ai].chats[fi].autonamed {
+            self.spaces[ai].chats[fi].title = slug(&prompt);
+            self.spaces[ai].chats[fi].autonamed = true;
+        }
         self.input.clear();
         self.mode = Mode::Normal;
         self.spawn_for(ai, fi, prompt);
