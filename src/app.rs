@@ -1,17 +1,21 @@
-//! App state + update logic — two-level model.
+//! App state + update logic — single-session model.
 //!
-//! A **Space** is a named container of 1–4 **Chats**. The sidebar lists spaces;
-//! the active space renders its chats as split panes. Every chat belongs to
-//! exactly one space; deleting a space's last chat deletes the space. Spaces can
-//! be merged (chats combined, ≤4) and a chat can be popped out into its own space.
+//! One launch = one conversation with one long-lived claude child, DeepSeek-TUI
+//! style. Multiplexing lives outside (tmux panes each run their own `avim`,
+//! keyed per tmux session). The app starts in Insert mode, ready to type.
 
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use std::time::Instant;
+
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    MouseEvent, MouseEventKind,
+};
+use crossterm::execute;
 use tokio::sync::mpsc::UnboundedSender;
 use uuid::Uuid;
 
 use serde_json::Value;
 
-use crate::agent::{spawn_turn, TurnSpec};
 use crate::protocol::AgentEvent;
 use crate::store::{self, PersistChat, PersistSpace};
 
@@ -21,26 +25,7 @@ pub enum Mode {
     Insert,
     Command,
     Rename,
-    Picker,
     Confirm,
-}
-
-#[derive(PartialEq, Clone, Copy)]
-pub enum Focus {
-    Sidebar,
-    Main,
-}
-
-#[derive(PartialEq, Clone, Copy)]
-pub enum RenameTarget {
-    Space,
-    Chat,
-}
-
-#[derive(PartialEq, Clone, Copy)]
-pub enum SplitDir {
-    V,
-    H,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -49,149 +34,267 @@ pub enum Pending {
     G,
     Z,
     Leader,
-    LeaderE,
-    LeaderN,
-    LeaderS,
-    LeaderT,
-    LeaderZ,
 }
 
-#[derive(Clone, Copy)]
-enum Dir {
-    Left,
-    Right,
-    Up,
-    Down,
+#[derive(Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum DiffKind {
+    Ctx,
+    Add,
+    Del,
+    Gap,
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct DiffLine {
+    pub kind: DiffKind,
+    pub text: String,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub enum Entry {
     User(String),
     Assistant(String),
     Tool(String),
     ToolResult { ok: bool, text: String },
+    /// A code edit rendered as a colored +/- hunk (Claude-Code-style), sitting
+    /// directly under its `● Update(file)` tool header.
+    Diff {
+        file: String,
+        added: usize,
+        removed: usize,
+        lines: Vec<DiffLine>,
+    },
     Note(String),
     Error(String),
 }
 
 pub struct Chat {
-    pub id: u64,
     pub title: String,
-    pub autonamed: bool,
     pub transcript: Vec<Entry>,
+    /// Bumped on every transcript mutation — the render cache's invalidation key.
+    pub rev: u64,
     pub streaming: Option<String>,
     pub in_flight: bool,
     pub session_id: String,
     pub first_turn: bool,
     pub cost: f64,
-    pub scroll: u16,
+    pub scroll: usize,
     pub follow: bool,
-    pub last_max_scroll: u16,
+    pub last_max_scroll: usize,
+    /// When the in-flight turn started — drives the live "Ns" elapsed counter.
+    pub turn_started: Option<Instant>,
+    /// Short label of what the turn is doing right now ("Thinking",
+    /// "Bash(cargo build)", "Responding") — shown in the working line.
+    pub activity: Option<String>,
+    /// Last prompt sent, kept so a stale-session resume can be replayed once.
+    pub last_prompt: Option<String>,
+    /// Guards the resume self-heal to a single retry per turn.
+    pub healed_once: bool,
+    /// Prompts typed while a turn is in flight — sent in order as it frees up.
+    pub queue: Vec<String>,
+    /// The live claude child (spawned lazily on first send).
+    pub session: Option<crate::agent::SessionHandle>,
+    /// An interrupt was requested for the in-flight turn (Esc again = hard kill).
+    pub interrupting: bool,
+    /// za — render tool results in full instead of one summary line.
+    pub expand_tools: bool,
+    /// In-flight tool calls: (tool_use_id, transcript index of the ● Tool entry),
+    /// so each result lands under ITS call even when calls run in parallel.
+    pub pending_tools: Vec<(String, usize)>,
+    /// Pre-wrapped visual rows of the settled transcript, keyed by (rev, width,
+    /// expand_tools). Streaming only rebuilds the tail — never this.
+    pub cache: crate::ui::RenderCache,
 }
 
 impl Chat {
-    fn fresh(id: u64) -> Self {
+    fn fresh() -> Self {
         let session_id = Uuid::new_v4().to_string();
-        let mut transcript = Vec::new();
-        transcript.push(Entry::Note(format!("session {}", &session_id[..8])));
+        Chat::blank(session_id, String::new(), true, 0.0)
+    }
+
+    fn from_persist(pc: &PersistChat) -> Self {
+        // `started` decides --session-id vs --resume on the next spawn: a chat
+        // that never actually sent a turn must NOT try to resume a session that
+        // claude has no record of.
+        let mut c = Chat::blank(pc.session_id.clone(), pc.title.clone(), !pc.started, pc.cost);
+        if !pc.transcript.is_empty() {
+            c.transcript = pc.transcript.clone();
+            c.rev += 1;
+        }
+        c
+    }
+
+    fn blank(session_id: String, title: String, first_turn: bool, cost: f64) -> Self {
         Chat {
-            id,
-            title: String::new(),
-            autonamed: false,
-            transcript,
+            title,
+            transcript: Vec::new(),
+            rev: 0,
             streaming: None,
             in_flight: false,
             session_id,
-            first_turn: true,
-            cost: 0.0,
+            first_turn,
+            cost,
             scroll: 0,
             follow: true,
             last_max_scroll: 0,
+            turn_started: None,
+            activity: None,
+            last_prompt: None,
+            healed_once: false,
+            queue: Vec::new(),
+            session: None,
+            interrupting: false,
+            expand_tools: false,
+            pending_tools: Vec::new(),
+            cache: crate::ui::RenderCache::default(),
         }
     }
 
-    fn from_persist(id: u64, pc: &PersistChat) -> Self {
-        let mut transcript = Vec::new();
-        transcript.push(Entry::Note(format!(
-            "resumed · session {} (send a message to continue)",
-            &pc.session_id[..8.min(pc.session_id.len())]
-        )));
-        Chat {
-            id,
-            title: pc.title.clone(),
-            autonamed: true,
-            transcript,
-            streaming: None,
-            in_flight: false,
-            session_id: pc.session_id.clone(),
-            first_turn: false,
-            cost: pc.cost,
-            scroll: 0,
-            follow: true,
-            last_max_scroll: 0,
+    /// Append an entry. ALL transcript mutations go through push/insert/clear so
+    /// `rev` stays honest — the render cache keys off it.
+    pub fn push(&mut self, e: Entry) {
+        self.transcript.push(e);
+        self.rev += 1;
+    }
+
+    fn note(&mut self, s: impl Into<String>) {
+        self.push(Entry::Note(s.into()));
+    }
+
+    /// Insert a tool result directly under its tool call (and its diff, if any),
+    /// keeping `pending_tools` indices consistent.
+    fn insert_tool_result(&mut self, id: &str, ok: bool, text: String) {
+        let entry = Entry::ToolResult { ok, text };
+        let Some(pos) = self.pending_tools.iter().position(|(tid, _)| tid == id) else {
+            self.push(entry);
+            return;
+        };
+        let (_, tidx) = self.pending_tools.remove(pos);
+        let mut at = (tidx + 1).min(self.transcript.len());
+        if matches!(self.transcript.get(at), Some(Entry::Diff { .. })) {
+            at += 1;
         }
+        self.transcript.insert(at, entry);
+        self.rev += 1;
+        for (_, i) in self.pending_tools.iter_mut() {
+            if *i >= at {
+                *i += 1;
+            }
+        }
+    }
+
+    fn clear_transcript(&mut self) {
+        self.transcript.clear();
+        self.pending_tools.clear();
+        self.rev += 1;
     }
 
     fn commit_streaming(&mut self) {
         if let Some(s) = self.streaming.take() {
             if !s.trim().is_empty() {
-                self.transcript.push(Entry::Assistant(s));
+                self.push(Entry::Assistant(s));
             }
         }
     }
-}
 
-pub struct Space {
-    pub id: u64,
-    pub name: String,
-    pub chats: Vec<Chat>,
-    pub focused: usize,
-    pub split_dir: SplitDir,
-    pub zoom: bool,
-}
-
-impl Space {
-    fn one(id: u64, chat: Chat) -> Self {
-        Space {
-            id,
-            name: String::new(),
-            chats: vec![chat],
-            focused: 0,
-            split_dir: SplitDir::V,
-            zoom: false,
+    /// Keep the transcript bounded so it doesn't grow without limit on disk or
+    /// in memory. Only called at turn boundaries (pending_tools indices would
+    /// otherwise shift mid-turn).
+    fn trim(&mut self) {
+        const CAP: usize = 300;
+        const MARK: &str = "… earlier messages trimmed";
+        if self.transcript.len() <= CAP {
+            return;
         }
+        let drop = self.transcript.len() - CAP;
+        self.transcript.drain(0..drop);
+        let marked = matches!(self.transcript.first(), Some(Entry::Note(n)) if n == MARK);
+        if !marked {
+            self.transcript.insert(0, Entry::Note(MARK.into()));
+        }
+        self.rev += 1;
     }
-    pub fn fi(&self) -> usize {
-        self.focused.min(self.chats.len().saturating_sub(1))
+}
+
+/// Bound one tool result for storage: keep the head and tail, elide the middle.
+/// Full output for normal cases, but a 100k-line build log can't bloat the
+/// transcript, the render, or the state file.
+fn cap_tool_text(text: &str) -> String {
+    const HEAD: usize = 160;
+    const TAIL: usize = 40;
+    const MAX_BYTES: usize = 32 * 1024;
+    let lines: Vec<&str> = text.lines().collect();
+    let capped: String = if lines.len() > HEAD + TAIL + 1 {
+        let omitted = lines.len() - HEAD - TAIL;
+        let mut s = lines[..HEAD].join("\n");
+        s.push('\n');
+        s.push_str(&format!("… {omitted} lines omitted …"));
+        s.push('\n');
+        s.push_str(&lines[lines.len() - TAIL..].join("\n"));
+        s
+    } else {
+        text.to_string()
+    };
+    if capped.len() > MAX_BYTES {
+        let mut cut = MAX_BYTES;
+        while !capped.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        format!("{}\n… (truncated)", &capped[..cut])
+    } else {
+        capped
     }
 }
 
 pub fn chat_title(c: &Chat) -> String {
     if c.title.trim().is_empty() {
-        "untitled".to_string()
+        "new conversation".to_string()
     } else {
         c.title.clone()
     }
 }
 
-/// Display name for a space: its name, else (single chat) the chat's title.
-pub fn space_name(sp: &Space) -> String {
-    if !sp.name.trim().is_empty() {
-        sp.name.clone()
-    } else {
-        "space".to_string()
-    }
+/// True when `name` is still an auto-generated default or empty — used so the
+/// first rename starts from an empty buffer, and auto-naming can take over.
+fn is_default_name(name: &str) -> bool {
+    let name = name.trim();
+    name.is_empty() || name == "new conversation"
 }
 
 fn slug(s: &str) -> String {
     let one_line: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
     if one_line.trim().is_empty() {
-        return "chat".into();
+        return "conversation".into();
     }
-    let mut out: String = one_line.chars().take(28).collect();
-    if one_line.chars().count() > 28 {
+    let mut out: String = one_line.chars().take(36).collect();
+    if one_line.chars().count() > 36 {
         out.push('…');
     }
     out
+}
+
+/// Byte offset of the grapheme boundary before `at` (0 if already at start).
+pub fn prev_grapheme(s: &str, at: usize) -> usize {
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut prev = 0;
+    for (i, _) in s.grapheme_indices(true) {
+        if i >= at {
+            break;
+        }
+        prev = i;
+    }
+    prev
+}
+
+/// Byte offset of the grapheme boundary after `at` (len if already at end).
+pub fn next_grapheme(s: &str, at: usize) -> usize {
+    use unicode_segmentation::UnicodeSegmentation;
+    for (i, g) in s.grapheme_indices(true) {
+        if i >= at {
+            return i + g.len();
+        }
+    }
+    s.len()
 }
 
 fn short_path(p: &str) -> String {
@@ -206,7 +309,7 @@ fn short_path(p: &str) -> String {
 
 /// Strip ANSI/OSC escape sequences and other control chars so no raw escapes
 /// ever reach the ratatui cell buffer (they'd otherwise be re-interpreted by the
-/// terminal and corrupt neighbouring panes). Tabs → space.
+/// terminal and corrupt the screen). Tabs → space.
 pub fn clean_line(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut it = s.chars().peekable();
@@ -233,11 +336,60 @@ pub fn clean_line(s: &str) -> String {
                         }
                     }
                 }
+                // Two-char escape (ESC c, ESC 7, alt-key…): consume the pair,
+                // but never eat a non-ASCII char that just followed a stray ESC.
+                Some(&n) if n.is_ascii() => {
+                    it.next();
+                }
+                _ => {}
+            },
+            '\t' => out.push(' '),
+            // Bidi overrides / isolates / marks: a model emitting U+202E would
+            // reverse the rest of the on-screen line — drop them.
+            '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' => {}
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Clean pasted text for the composer: normalise CRLF/CR → LF, keep newlines,
+/// expand tabs to spaces, and drop other control chars (so a paste can't smuggle
+/// raw escapes into the buffer). Newlines are preserved for multi-line prompts.
+fn sanitize_paste(s: &str) -> String {
+    let s = s.replace("\r\n", "\n").replace('\r', "\n");
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        match c {
+            // Strip whole ANSI CSI / OSC sequences (pasted terminal output), not
+            // just the ESC byte — otherwise "[31m" litter survives.
+            '\u{1b}' => match it.peek() {
+                Some('[') => {
+                    it.next();
+                    while let Some(&n) = it.peek() {
+                        it.next();
+                        if ('\u{40}'..='\u{7e}').contains(&n) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    it.next();
+                    while let Some(&n) = it.peek() {
+                        it.next();
+                        if n == '\u{07}' || n == '\u{1b}' {
+                            break;
+                        }
+                    }
+                }
                 _ => {
                     it.next();
                 }
             },
-            '\t' => out.push(' '),
+            '\n' => out.push('\n'),
+            '\t' => out.push_str("    "),
             c if c.is_control() => {}
             c => out.push(c),
         }
@@ -254,24 +406,7 @@ fn truncate_str(s: &str, n: usize) -> String {
     }
 }
 
-/// Compact a tool result to one clean line (+N lines) for the transcript.
-fn tool_result_summary(text: &str) -> String {
-    let lines: Vec<&str> = text.lines().collect();
-    let first = lines
-        .iter()
-        .find(|l| !l.trim().is_empty())
-        .copied()
-        .unwrap_or("");
-    let clean = truncate_str(first, 72);
-    let extra = lines.len().saturating_sub(1);
-    if extra > 0 {
-        format!("{clean}  (+{extra} lines)")
-    } else {
-        clean
-    }
-}
-
-/// Format a tool call the way Claude Code shows it: ⏺ Tool(arg) + a summary.
+/// Format a tool call the way Claude Code shows it: ● Tool(arg) + a summary.
 fn format_tool(name: &str, input: &Value) -> String {
     let get = |k: &str| input.get(k).and_then(|x| x.as_str()).unwrap_or("");
     match name {
@@ -307,6 +442,155 @@ fn format_tool(name: &str, input: &Value) -> String {
     }
 }
 
+/// Line-level diff of `old` → `new` via LCS, then collapse long runs of
+/// unchanged context to a few lines around each change (Gap marks the elision).
+/// Returns (added, removed, lines). Guards against pathological sizes.
+fn line_diff(old: &str, new: &str) -> (usize, usize, Vec<DiffLine>) {
+    let a: Vec<&str> = old.lines().collect();
+    let b: Vec<&str> = new.lines().collect();
+    let mk = |kind, s: &str| DiffLine { kind, text: clean_line(s) };
+
+    // Big replacements: skip the O(n·m) table and just show removals then adds.
+    if a.len() > 400 || b.len() > 400 {
+        let mut lines: Vec<DiffLine> = a.iter().map(|l| mk(DiffKind::Del, l)).collect();
+        lines.extend(b.iter().map(|l| mk(DiffKind::Add, l)));
+        return (b.len(), a.len(), collapse_ctx(lines));
+    }
+
+    let (n, m) = (a.len(), b.len());
+    let mut dp = vec![vec![0u16; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            dp[i][j] = if a[i] == b[j] {
+                dp[i + 1][j + 1] + 1
+            } else {
+                dp[i + 1][j].max(dp[i][j + 1])
+            };
+        }
+    }
+    let (mut i, mut j) = (0, 0);
+    let (mut added, mut removed) = (0, 0);
+    let mut lines = Vec::new();
+    while i < n && j < m {
+        if a[i] == b[j] {
+            lines.push(mk(DiffKind::Ctx, a[i]));
+            i += 1;
+            j += 1;
+        } else if dp[i + 1][j] >= dp[i][j + 1] {
+            lines.push(mk(DiffKind::Del, a[i]));
+            removed += 1;
+            i += 1;
+        } else {
+            lines.push(mk(DiffKind::Add, b[j]));
+            added += 1;
+            j += 1;
+        }
+    }
+    while i < n {
+        lines.push(mk(DiffKind::Del, a[i]));
+        removed += 1;
+        i += 1;
+    }
+    while j < m {
+        lines.push(mk(DiffKind::Add, b[j]));
+        added += 1;
+        j += 1;
+    }
+    (added, removed, collapse_ctx(lines))
+}
+
+/// Keep at most `CTX` context lines adjacent to any change; replace longer
+/// unchanged stretches with a single Gap marker so the hunk stays compact.
+fn collapse_ctx(lines: Vec<DiffLine>) -> Vec<DiffLine> {
+    const CTX: usize = 2;
+    let n = lines.len();
+    let changed: Vec<bool> = lines.iter().map(|l| l.kind != DiffKind::Ctx).collect();
+    // A context line is kept if some change lies within CTX rows of it.
+    let keep: Vec<bool> = (0..n)
+        .map(|idx| {
+            let lo = idx.saturating_sub(CTX);
+            let hi = (idx + CTX + 1).min(n);
+            lines[idx].kind != DiffKind::Ctx || changed[lo..hi].iter().any(|&c| c)
+        })
+        .collect();
+    let mut out = Vec::new();
+    let mut gapped = false;
+    for idx in 0..n {
+        if keep[idx] {
+            out.push(lines[idx].clone());
+            gapped = false;
+        } else if !gapped {
+            out.push(DiffLine {
+                kind: DiffKind::Gap,
+                text: "⋯".into(),
+            });
+            gapped = true;
+        }
+    }
+    out
+}
+
+/// Bound a rendered hunk: a Write of a 5000-line file must not become 5000
+/// transcript lines (rendered every frame, persisted every save). Head + tail
+/// with an elision marker keeps the shape visible.
+fn cap_diff(lines: Vec<DiffLine>) -> Vec<DiffLine> {
+    const HEAD: usize = 120;
+    const TAIL: usize = 30;
+    if lines.len() <= HEAD + TAIL + 1 {
+        return lines;
+    }
+    let omitted = lines.len() - HEAD - TAIL;
+    let mut out: Vec<DiffLine> = lines[..HEAD].to_vec();
+    out.push(DiffLine {
+        kind: DiffKind::Gap,
+        text: format!("⋯ {omitted} more lines"),
+    });
+    out.extend_from_slice(&lines[lines.len() - TAIL..]);
+    out
+}
+
+/// Build a diff entry for an edit-shaped tool (Edit/MultiEdit/Write/…). Returns
+/// (file, added, removed, lines), or None for tools that aren't edits.
+fn build_diff(name: &str, input: &Value) -> Option<(String, usize, usize, Vec<DiffLine>)> {
+    let get = |k: &str| input.get(k).and_then(|x| x.as_str()).unwrap_or("");
+    match name {
+        "Edit" | "Update" => {
+            let (a, r, lines) = line_diff(get("old_string"), get("new_string"));
+            Some((short_path(get("file_path")), a, r, cap_diff(lines)))
+        }
+        "Write" => {
+            let (a, r, lines) = line_diff("", get("content"));
+            Some((short_path(get("file_path")), a, r, cap_diff(lines)))
+        }
+        "MultiEdit" => {
+            let edits = input.get("edits").and_then(Value::as_array)?;
+            let (mut added, mut removed) = (0, 0);
+            let mut lines: Vec<DiffLine> = Vec::new();
+            for (k, e) in edits.iter().enumerate() {
+                let os = e.get("old_string").and_then(Value::as_str).unwrap_or("");
+                let ns = e.get("new_string").and_then(Value::as_str).unwrap_or("");
+                let (a, r, mut ls) = line_diff(os, ns);
+                added += a;
+                removed += r;
+                if k > 0 {
+                    lines.push(DiffLine { kind: DiffKind::Gap, text: "⋯".into() });
+                }
+                lines.append(&mut ls);
+            }
+            Some((short_path(get("file_path")), added, removed, cap_diff(lines)))
+        }
+        _ => None,
+    }
+}
+
+/// One-line label of a running tool for the working line, e.g. "Bash(cargo
+/// build)" — the first line of `format_tool` with its leading "● " stripped.
+fn tool_activity(name: &str, input: &Value) -> String {
+    let full = format_tool(name, input);
+    let first = full.lines().next().unwrap_or(name);
+    first.trim_start_matches("● ").to_string()
+}
+
 fn format_todos(input: &Value) -> String {
     let mut out = String::from("● Todos");
     if let Some(arr) = input.get("todos").and_then(Value::as_array) {
@@ -326,40 +610,48 @@ fn format_todos(input: &Value) -> String {
 pub enum Msg {
     Input(Event),
     Tick,
+    // `chat` ids stay on the wire so agent.rs needs no rewiring when
+    // multi-session returns; the single-session app ignores them.
+    #[allow(dead_code)]
     Agent { chat: u64, ev: AgentEvent },
-    TurnEnded { chat: u64, error: Option<String> },
-    Pipe { to: String, from: String, message: String },
+    /// The claude child exited (crash, error, or deliberate kill).
+    #[allow(dead_code)]
+    SessionEnded { chat: u64, error: Option<String> },
+    /// Clipboard contents read off the UI task (Ctrl-v fallback).
+    Pasted(String),
 }
+
+/// The single chat's id on the Msg wire (kept so agent.rs stays id-based and a
+/// multi-session future doesn't rewire the protocol).
+const CHAT_ID: u64 = 1;
 
 pub struct App {
     pub mode: Mode,
-    pub focus: Focus,
     pub pending: Pending,
     pub input: String,
+    /// Cursor position in `input`: a byte offset on a grapheme boundary.
+    pub input_cursor: usize,
     pub cmd: String,
     pub rename_buf: String,
-    pub rename_target: RenameTarget,
-    pub picker_query: String,
-    pub picker_sel: usize,
-    pub spaces: Vec<Space>,
-    pub active_space: usize,
-    pub sidebar_cursor: usize,
-    pub sidebar_open: bool,
-    selected: Vec<u64>,
-    pending_delete: Vec<u64>,
+    pub chat: Chat,
+    /// The confirm overlay is asking about quitting.
+    pending_quit: bool,
     pub confirm_msg: String,
+    /// Something on screen changed since the last draw (main loop's redraw gate).
+    pub dirty: bool,
+    /// One-line notice for the statusline (corrupt state file, bad command, …).
+    pub toast: Option<String>,
     pub model_cli: Option<String>,
     pub model_display: String,
     pub dangerous: bool,
     pub should_quit: bool,
     pub spinner: usize,
     pub help_open: bool,
+    /// Mouse capture state. Default OFF so the cursor can select/copy text (and
+    /// tmux/Ghostty native selection works); `:mouse` toggles wheel-scroll on.
+    pub mouse_capture: bool,
     pub slash_commands: Vec<String>,
     pub slash_sel: usize,
-    next_chat_id: u64,
-    next_space_id: u64,
-    chat_counter: u64,
-    space_counter: u64,
     workspace_key: String,
     tx: UnboundedSender<Msg>,
 }
@@ -373,121 +665,75 @@ impl App {
         restored: Vec<PersistSpace>,
     ) -> Self {
         let model_display = model_cli.clone().unwrap_or_else(|| "default".into());
-        let mut spaces = Vec::new();
-        let mut next_chat_id = 1u64;
-        let mut next_space_id = 1u64;
-        let chat_counter = 1u64;
-        let space_counter = 1u64;
-
-        for ps in &restored {
-            let mut chats: Vec<Chat> = Vec::new();
-            for pc in ps.chats.iter().take(4) {
-                chats.push(Chat::from_persist(next_chat_id, pc));
-                next_chat_id += 1;
-            }
-            if chats.is_empty() {
-                continue;
-            }
-            spaces.push(Space {
-                id: next_space_id,
-                name: ps.name.clone(),
-                chats,
-                focused: 0,
-                split_dir: SplitDir::V,
-                zoom: false,
-            });
-            next_space_id += 1;
-        }
-        // No spaces (deleted-all, or first run) → stay empty and show the
-        // "start a space" state; do not auto-create a default space.
+        // Single-session model: adopt the first saved chat; anything beyond it
+        // was already backed up by main() before we overwrite on save.
+        let chat = restored
+            .first()
+            .and_then(|sp| sp.chats.first())
+            .map(Chat::from_persist)
+            .unwrap_or_else(Chat::fresh);
 
         Self {
-            mode: Mode::Normal,
-            focus: Focus::Main,
+            mode: Mode::Insert, // launch ready to type
             pending: Pending::None,
             input: String::new(),
+            input_cursor: 0,
             cmd: String::new(),
             rename_buf: String::new(),
-            rename_target: RenameTarget::Space,
-            picker_query: String::new(),
-            picker_sel: 0,
-            spaces,
-            active_space: 0,
-            sidebar_cursor: 0,
-            sidebar_open: true,
-            selected: Vec::new(),
-            pending_delete: Vec::new(),
+            chat,
+            pending_quit: false,
             confirm_msg: String::new(),
+            dirty: true,
+            toast: None,
             model_cli,
             model_display,
             dangerous,
             should_quit: false,
             spinner: 0,
             help_open: false,
+            mouse_capture: false,
             slash_commands: Vec::new(),
             slash_sel: 0,
-            next_chat_id,
-            next_space_id,
-            chat_counter,
-            space_counter,
             workspace_key,
             tx,
         }
     }
 
-    // ---- lookups ----
+    /// Flip mouse capture. OFF lets the cursor select/copy text (tmux/Ghostty
+    /// native selection); ON restores wheel-scroll but intercepts drag-select.
+    fn toggle_mouse(&mut self) {
+        self.set_mouse(!self.mouse_capture);
+    }
 
-    pub fn cur_chat(&self) -> &Chat {
-        let sp = &self.spaces[self.active_space];
-        &sp.chats[sp.fi()]
-    }
-    fn cur_chat_mut(&mut self) -> &mut Chat {
-        let ai = self.active_space;
-        let fi = self.spaces[ai].fi();
-        &mut self.spaces[ai].chats[fi]
-    }
-    fn chat_by_id_mut(&mut self, id: u64) -> Option<&mut Chat> {
-        for sp in &mut self.spaces {
-            for c in &mut sp.chats {
-                if c.id == id {
-                    return Some(c);
-                }
+    pub fn set_mouse(&mut self, on: bool) {
+        self.mouse_capture = on;
+        let mut out = std::io::stdout();
+        let _ = if on {
+            execute!(out, EnableMouseCapture)
+        } else {
+            execute!(out, DisableMouseCapture)
+        };
+        self.toast = Some(
+            if on {
+                "mouse ON — wheel scrolls; drag-select needs Shift/Option"
+            } else {
+                "mouse OFF — drag to select/copy; scroll with j/k · Ctrl-d/u"
             }
-        }
-        None
-    }
-    fn space_index(&self, id: u64) -> Option<usize> {
-        self.spaces.iter().position(|s| s.id == id)
-    }
-    pub fn sel_space_id(&self) -> Option<u64> {
-        self.spaces.get(self.sidebar_cursor).map(|s| s.id)
-    }
-    pub fn is_selected(&self, id: u64) -> bool {
-        self.selected.contains(&id)
-    }
-    pub fn any_in_flight(&self) -> bool {
-        self.spaces
-            .iter()
-            .any(|sp| sp.chats.iter().any(|c| c.in_flight))
+            .into(),
+        );
     }
 
     pub fn persist(&self) {
-        let data: Vec<PersistSpace> = self
-            .spaces
-            .iter()
-            .map(|sp| PersistSpace {
-                name: sp.name.clone(),
-                chats: sp
-                    .chats
-                    .iter()
-                    .map(|c| PersistChat {
-                        title: c.title.clone(),
-                        session_id: c.session_id.clone(),
-                        cost: c.cost,
-                    })
-                    .collect(),
-            })
-            .collect();
+        let data = vec![PersistSpace {
+            name: String::new(),
+            chats: vec![PersistChat {
+                title: self.chat.title.clone(),
+                session_id: self.chat.session_id.clone(),
+                cost: self.chat.cost,
+                started: !self.chat.first_turn,
+                transcript: self.chat.transcript.clone(),
+            }],
+        }];
         store::save(&self.workspace_key, &data);
     }
 
@@ -495,92 +741,167 @@ impl App {
 
     pub fn handle(&mut self, msg: Msg) {
         match msg {
-            Msg::Tick => self.spinner = self.spinner.wrapping_add(1),
-            Msg::Input(Event::Key(k)) => self.handle_key(k),
-            Msg::Input(_) => {}
-            Msg::Pipe { to, from, message } => self.inject_pipe(to, from, message),
-            Msg::Agent { chat, ev } => self.handle_agent(chat, ev),
-            Msg::TurnEnded { chat, error } => {
-                if let Some(c) = self.chat_by_id_mut(chat) {
-                    if c.in_flight {
-                        c.commit_streaming();
-                        c.in_flight = false;
-                        c.follow = true;
-                    }
-                    if let Some(e) = error {
-                        c.transcript.push(Entry::Error(e));
-                    }
-                }
-                self.persist();
+            Msg::Tick => {
+                // Spinner + elapsed timers advance on the tick, not per event.
+                self.spinner = self.spinner.wrapping_add(1);
+                return; // tick alone doesn't set dirty; main loop redraws while in-flight
             }
+            Msg::Input(Event::Key(k)) => self.handle_key(k),
+            Msg::Input(Event::Mouse(m)) => self.handle_mouse(m),
+            Msg::Input(Event::Paste(s)) => self.paste(s),
+            Msg::Input(_) => {}
+            Msg::Pasted(s) => self.paste(s),
+            Msg::Agent { ev, .. } => self.handle_agent(ev),
+            Msg::SessionEnded { error, .. } => self.session_ended(error),
         }
+        self.dirty = true;
     }
 
-    fn handle_agent(&mut self, id: u64, ev: AgentEvent) {
-        let is_result = matches!(ev, AgentEvent::TurnResult { .. });
-        let mut model_update = None;
-        let mut slash_update = None;
-        if let Some(c) = self.chat_by_id_mut(id) {
-            match ev {
-                AgentEvent::Init { session_id, model, slash_commands } => {
-                    if let Some(s) = session_id {
-                        c.session_id = s;
-                    }
-                    if let Some(m) = model {
-                        model_update = Some(m);
-                    }
-                    if !slash_commands.is_empty() {
-                        slash_update = Some(slash_commands);
-                    }
-                }
-                AgentEvent::TextDelta(s) => {
-                    c.follow = true;
-                    c.streaming.get_or_insert_with(String::new).push_str(&s);
-                }
-                AgentEvent::AssistantFinal(s) => {
-                    if c.streaming.as_ref().map_or(true, |x| x.trim().is_empty()) {
-                        c.streaming = Some(s);
-                    }
-                }
-                AgentEvent::ToolCall { name, input } => {
-                    c.commit_streaming();
-                    c.transcript.push(Entry::Tool(format_tool(&name, &input)));
-                    c.follow = true;
-                }
-                AgentEvent::ToolResult { ok, text } => {
-                    let summary = tool_result_summary(&text);
-                    if !summary.is_empty() {
-                        c.transcript.push(Entry::ToolResult { ok, text: summary });
-                        c.follow = true;
-                    }
-                }
-                AgentEvent::TurnResult { cost_usd, is_error, text } => {
-                    if c.streaming.as_ref().map_or(true, |x| x.trim().is_empty()) {
-                        if let Some(t) = text {
-                            if !t.trim().is_empty() {
-                                c.streaming = Some(t);
-                            }
-                        }
-                    }
-                    c.commit_streaming();
-                    c.cost += cost_usd;
+    /// The claude child exited. A clean exit (deliberate kill, stdin close) is
+    /// quiet; a crash mid-turn surfaces the error. A stale `--resume`
+    /// self-heals once by re-minting the session and replaying the last prompt.
+    fn session_ended(&mut self, error: Option<String>) {
+        if error
+            .as_deref()
+            .is_some_and(|e| e.contains("No conversation found with session ID"))
+        {
+            let replay = {
+                let c = &mut self.chat;
+                c.session = None;
+                if !c.healed_once && c.last_prompt.is_some() {
+                    c.healed_once = true;
                     c.in_flight = false;
-                    if is_error {
-                        c.transcript.push(Entry::Error("turn ended with error".into()));
-                    }
-                    c.follow = true;
+                    c.streaming = None;
+                    // Fresh id + first-turn so claude creates the session
+                    // cleanly (the old id can't be reused).
+                    c.session_id = Uuid::new_v4().to_string();
+                    c.first_turn = true;
+                    c.note("session was gone — starting fresh");
+                    c.last_prompt.clone()
+                } else {
+                    None
                 }
+            };
+            if let Some(p) = replay {
+                self.deliver(p, false);
+                return;
             }
         }
-        self.spinner = self.spinner.wrapping_add(1);
-        if let Some(m) = model_update {
-            self.model_display = m;
+        let c = &mut self.chat;
+        c.session = None;
+        let was_interrupting = c.interrupting;
+        c.interrupting = false;
+        if c.in_flight {
+            c.commit_streaming();
+            c.in_flight = false;
+            if was_interrupting {
+                c.note("⎋ stopped");
+            } else if error.is_none() {
+                c.note("session ended");
+            }
         }
-        if let Some(sc) = slash_update {
-            self.slash_commands = sc;
+        c.turn_started = None;
+        c.activity = None;
+        c.pending_tools.clear();
+        if let Some(e) = error {
+            c.push(Entry::Error(e));
+        }
+        c.trim();
+        self.persist();
+        self.drain_queue();
+    }
+
+    fn handle_agent(&mut self, ev: AgentEvent) {
+        let is_result = matches!(ev, AgentEvent::TurnResult { .. });
+        let c = &mut self.chat;
+        match ev {
+            AgentEvent::Init { session_id, model, slash_commands } => {
+                if let Some(s) = session_id {
+                    c.session_id = s;
+                }
+                if let Some(m) = model {
+                    self.model_display = m;
+                }
+                if !slash_commands.is_empty() {
+                    self.slash_commands = slash_commands;
+                }
+            }
+            AgentEvent::TextDelta(s) => {
+                // NOTE: never touches `follow` — content arrival must not
+                // fight the user's scroll position.
+                c.activity = Some("Responding".into());
+                c.streaming.get_or_insert_with(String::new).push_str(&s);
+            }
+            AgentEvent::ThinkingDelta => {
+                if c.streaming.is_none() {
+                    c.activity = Some("Thinking".into());
+                }
+            }
+            AgentEvent::AssistantText(s) => {
+                // Authoritative text of one assistant message: replaces the
+                // delta accumulation (which can be lossy) and commits, so a
+                // multi-message turn (text → tools → text) keeps its shape.
+                c.streaming = None;
+                c.push(Entry::Assistant(s));
+            }
+            AgentEvent::ToolCall { id, name, input } => {
+                c.commit_streaming();
+                c.activity = Some(tool_activity(&name, &input));
+                // Edits render as a colored +/- hunk under a bare header; every
+                // other tool keeps its one-line `● Tool(arg)` summary.
+                let tool_idx = c.transcript.len();
+                if let Some((file, added, removed, lines)) = build_diff(&name, &input) {
+                    let verb = if name == "Write" { "Write" } else { "Update" };
+                    c.push(Entry::Tool(format!("● {verb}({file})")));
+                    c.push(Entry::Diff { file, added, removed, lines });
+                } else {
+                    c.push(Entry::Tool(format_tool(&name, &input)));
+                }
+                if !id.is_empty() {
+                    c.pending_tools.push((id, tool_idx));
+                }
+            }
+            AgentEvent::ToolResult { id, ok, text } => {
+                // Back to thinking — the model decides its next step.
+                c.activity = Some("Thinking".into());
+                c.insert_tool_result(&id, ok, cap_tool_text(&text));
+            }
+            AgentEvent::TurnResult { cost_usd, is_error, subtype, .. } => {
+                // NOTE: result.text is deliberately unused — every assistant
+                // message already arrived via AssistantText; re-adding the
+                // result text duplicated the final message.
+                c.commit_streaming();
+                c.cost += cost_usd;
+                c.in_flight = false;
+                c.turn_started = None;
+                c.activity = None;
+                c.pending_tools.clear();
+                if c.interrupting {
+                    // We asked for this stop — a status line, not an error.
+                    c.interrupting = false;
+                    c.note("⎋ interrupted");
+                } else if is_error {
+                    let what = if subtype.is_empty() {
+                        "turn ended with error".to_string()
+                    } else {
+                        format!("turn ended with error ({subtype})")
+                    };
+                    c.push(Entry::Error(what));
+                }
+                c.trim();
+            }
+            AgentEvent::ControlDone { ok } => {
+                // Interrupt acked; the turn's error_during_execution result
+                // follows and lands in the arm above. A refused interrupt
+                // is worth surfacing (Esc again will force-kill).
+                if !ok && c.interrupting {
+                    c.note("interrupt not acknowledged — Esc again to force-kill");
+                }
+            }
         }
         if is_result {
             self.persist();
+            self.drain_queue();
         }
     }
 
@@ -590,16 +911,23 @@ impl App {
         if k.kind == KeyEventKind::Release {
             return;
         }
+        self.toast = None; // any keypress clears the statusline notice
+        let close_key = matches!(
+            k.code,
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char(' ')
+        );
         if self.help_open {
             self.help_open = false;
-            return;
+            if close_key {
+                return;
+            }
+            // other keys close the overlay AND still do their thing
         }
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         match self.mode {
             Mode::Command => self.key_command(k, ctrl),
             Mode::Rename => self.key_rename(k, ctrl),
             Mode::Insert => self.key_insert(k, ctrl),
-            Mode::Picker => self.key_picker(k, ctrl),
             Mode::Confirm => self.key_confirm(k),
             Mode::Normal => {
                 if self.pending != Pending::None {
@@ -619,12 +947,16 @@ impl App {
             }
             KeyCode::Enter => self.exec_command(),
             KeyCode::Backspace => {
-                self.cmd.pop();
+                let at = self.cmd.len();
+                let start = prev_grapheme(&self.cmd, at);
+                self.cmd.truncate(start);
             }
             KeyCode::Char('c') if ctrl => {
                 self.cmd.clear();
                 self.mode = Mode::Normal;
             }
+            KeyCode::Char('u') if ctrl => self.cmd.clear(),
+            KeyCode::Char('v') if ctrl => self.paste_from_clipboard(),
             KeyCode::Char(c) => self.cmd.push(c),
             _ => {}
         }
@@ -633,19 +965,30 @@ impl App {
     fn key_rename(&mut self, k: KeyEvent, ctrl: bool) {
         match k.code {
             KeyCode::Esc => self.mode = Mode::Normal,
-            KeyCode::Enter => self.rename_commit(),
+            KeyCode::Enter => {
+                let name = self.rename_buf.trim().to_string();
+                if !name.is_empty() {
+                    self.chat.title = name;
+                }
+                self.mode = Mode::Normal;
+                self.persist();
+            }
             KeyCode::Backspace => {
-                self.rename_buf.pop();
+                let at = self.rename_buf.len();
+                let start = prev_grapheme(&self.rename_buf, at);
+                self.rename_buf.truncate(start);
             }
             KeyCode::Char('c') if ctrl => self.mode = Mode::Normal,
             KeyCode::Char('u') if ctrl => self.rename_buf.clear(),
+            KeyCode::Char('v') if ctrl => self.paste_from_clipboard(),
             KeyCode::Char(c) => self.rename_buf.push(c),
             _ => {}
         }
     }
 
     fn key_insert(&mut self, k: KeyEvent, ctrl: bool) {
-        // slash-command popup navigation (when typing "/..." with no space yet)
+        // slash-command popup navigation (when typing "/..." with no space yet).
+        // Tab completes the selection; Enter always SENDS what's typed.
         if self.slash_active() {
             match k.code {
                 KeyCode::Down => {
@@ -664,7 +1007,7 @@ impl App {
                     self.slash_move(-1);
                     return;
                 }
-                KeyCode::Tab | KeyCode::Enter => {
+                KeyCode::Tab => {
                     self.slash_complete();
                     return;
                 }
@@ -673,22 +1016,167 @@ impl App {
         }
         match k.code {
             KeyCode::Esc => self.mode = Mode::Normal,
-            KeyCode::Enter => self.send_prompt(),
-            KeyCode::Backspace => {
-                self.input.pop();
-                self.slash_sel = 0;
+            // Shift/Alt+Enter inserts a newline (the box grows); plain Enter sends.
+            KeyCode::Enter
+                if k.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+            {
+                self.insert_at_cursor("\n");
             }
+            KeyCode::Char('j') if ctrl => self.insert_at_cursor("\n"),
+            KeyCode::Enter => self.send_prompt(),
+            KeyCode::Backspace => self.backspace_at_cursor(),
+            KeyCode::Delete => self.delete_at_cursor(),
+            KeyCode::Left => self.cursor_left(),
+            KeyCode::Right => self.cursor_right(),
+            KeyCode::Up => self.cursor_vertical(-1),
+            KeyCode::Down => self.cursor_vertical(1),
+            KeyCode::Home => self.cursor_line_home(),
+            KeyCode::End => self.cursor_line_end(),
+            KeyCode::Char('a') if ctrl => self.cursor_line_home(),
+            KeyCode::Char('e') if ctrl => self.cursor_line_end(),
+            KeyCode::Char('w') if ctrl => self.delete_word_back(),
             KeyCode::Char('u') if ctrl => {
                 self.input.clear();
+                self.input_cursor = 0;
                 self.slash_sel = 0;
             }
-            KeyCode::Char('c') if ctrl => self.should_quit = true,
+            KeyCode::Char('v') if ctrl => self.paste_from_clipboard(),
+            KeyCode::Char('d') if ctrl => self.scroll_down(8),
+            // Ctrl-C never quits from Insert: it clears the draft, or interrupts
+            // the running turn, or drops to Normal — in that order.
+            KeyCode::Char('c') if ctrl => {
+                if !self.input.is_empty() {
+                    self.input.clear();
+                    self.input_cursor = 0;
+                    self.slash_sel = 0;
+                } else if self.chat.in_flight {
+                    self.interrupt();
+                } else {
+                    self.mode = Mode::Normal;
+                }
+            }
+            KeyCode::PageUp => self.scroll_up(12),
+            KeyCode::PageDown => self.scroll_down(12),
             KeyCode::Char(c) => {
-                self.input.push(c);
-                self.slash_sel = 0;
+                let mut buf = [0u8; 4];
+                self.insert_at_cursor(c.encode_utf8(&mut buf));
             }
             _ => {}
         }
+    }
+
+    // ---- composer editing (cursor is a byte offset, always on a grapheme
+    // boundary — moves and deletes operate on whole graphemes so emoji and
+    // combining accents never shatter) ----
+
+    fn insert_at_cursor(&mut self, s: &str) {
+        let at = self.input_cursor.min(self.input.len());
+        self.input.insert_str(at, s);
+        self.input_cursor = at + s.len();
+        self.slash_sel = 0;
+    }
+
+    fn backspace_at_cursor(&mut self) {
+        let at = self.input_cursor.min(self.input.len());
+        if at == 0 {
+            return;
+        }
+        let start = prev_grapheme(&self.input, at);
+        self.input.replace_range(start..at, "");
+        self.input_cursor = start;
+        self.slash_sel = 0;
+    }
+
+    fn delete_at_cursor(&mut self) {
+        let at = self.input_cursor.min(self.input.len());
+        if at >= self.input.len() {
+            return;
+        }
+        let end = next_grapheme(&self.input, at);
+        self.input.replace_range(at..end, "");
+        self.slash_sel = 0;
+    }
+
+    fn cursor_left(&mut self) {
+        self.input_cursor = prev_grapheme(&self.input, self.input_cursor.min(self.input.len()));
+    }
+
+    fn cursor_right(&mut self) {
+        let at = self.input_cursor.min(self.input.len());
+        if at < self.input.len() {
+            self.input_cursor = next_grapheme(&self.input, at);
+        }
+    }
+
+    fn cursor_line_home(&mut self) {
+        let at = self.input_cursor.min(self.input.len());
+        self.input_cursor = self.input[..at].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    }
+
+    fn cursor_line_end(&mut self) {
+        let at = self.input_cursor.min(self.input.len());
+        self.input_cursor = self.input[at..]
+            .find('\n')
+            .map(|i| at + i)
+            .unwrap_or(self.input.len());
+    }
+
+    /// Move up/down one logical line, keeping the char column when possible.
+    fn cursor_vertical(&mut self, dir: isize) {
+        let at = self.input_cursor.min(self.input.len());
+        let line_start = self.input[..at].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let col = self.input[line_start..at].chars().count();
+        let target_start = if dir < 0 {
+            if line_start == 0 {
+                return;
+            }
+            self.input[..line_start - 1]
+                .rfind('\n')
+                .map(|i| i + 1)
+                .unwrap_or(0)
+        } else {
+            let Some(nl) = self.input[at..].find('\n') else {
+                return;
+            };
+            at + nl + 1
+        };
+        let target_line: &str = self.input[target_start..]
+            .split('\n')
+            .next()
+            .unwrap_or("");
+        let mut b = target_start;
+        for (n, ch) in target_line.chars().enumerate() {
+            if n >= col {
+                break;
+            }
+            b += ch.len_utf8();
+        }
+        self.input_cursor = b;
+    }
+
+    fn delete_word_back(&mut self) {
+        let at = self.input_cursor.min(self.input.len());
+        let before = &self.input[..at];
+        let trimmed = before.trim_end();
+        let cut = trimmed
+            .rfind(|c: char| c.is_whitespace())
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        self.input.replace_range(cut..at, "");
+        self.input_cursor = cut;
+        self.slash_sel = 0;
+    }
+
+    /// Ask before quitting — `q` used to kill the app (and the running turn)
+    /// with zero friction, which made stray Normal-mode typing catastrophic.
+    fn confirm_quit(&mut self) {
+        self.confirm_msg = if self.chat.in_flight {
+            "quit aeovim? a turn is still running   y / n".to_string()
+        } else {
+            "quit aeovim?   y / n".to_string()
+        };
+        self.pending_quit = true;
+        self.mode = Mode::Confirm;
     }
 
     fn all_slash_commands(&self) -> Vec<String> {
@@ -736,48 +1224,22 @@ impl App {
         let sel = self.slash_sel.min(matches.len().saturating_sub(1));
         if let Some(cmd) = matches.get(sel) {
             self.input = format!("/{cmd} ");
+            self.input_cursor = self.input.len();
         }
         self.slash_sel = 0;
-    }
-
-    fn key_picker(&mut self, k: KeyEvent, ctrl: bool) {
-        match k.code {
-            KeyCode::Esc => self.mode = Mode::Normal,
-            KeyCode::Enter => self.picker_commit(),
-            KeyCode::Backspace => {
-                self.picker_query.pop();
-                self.picker_sel = 0;
-            }
-            KeyCode::Char('c') if ctrl => self.mode = Mode::Normal,
-            KeyCode::Down => self.picker_down(),
-            KeyCode::Up => self.picker_up(),
-            KeyCode::Char('j') if ctrl => self.picker_down(),
-            KeyCode::Char('n') if ctrl => self.picker_down(),
-            KeyCode::Char('k') if ctrl => self.picker_up(),
-            KeyCode::Char('p') if ctrl => self.picker_up(),
-            KeyCode::Char(c) => {
-                self.picker_query.push(c);
-                self.picker_sel = 0;
-            }
-            _ => {}
-        }
     }
 
     fn key_confirm(&mut self, k: KeyEvent) {
         match k.code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                let ids = std::mem::take(&mut self.pending_delete);
-                for id in ids {
-                    if let Some(i) = self.space_index(id) {
-                        self.delete_space_at(i);
-                    }
+                if self.pending_quit {
+                    self.pending_quit = false;
+                    self.should_quit = true;
                 }
-                self.selected.clear();
                 self.mode = Mode::Normal;
-                self.persist();
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                self.pending_delete.clear();
+                self.pending_quit = false;
                 self.mode = Mode::Normal;
             }
             _ => {}
@@ -785,115 +1247,55 @@ impl App {
     }
 
     fn key_normal(&mut self, k: KeyEvent, ctrl: bool) {
-        if self.spaces.is_empty() {
-            match k.code {
-                KeyCode::Char('n') | KeyCode::Char('i') => {
-                    self.new_space();
-                    self.mode = Mode::Insert;
-                }
-                KeyCode::Char('a') => self.new_named_space(),
-                KeyCode::Char('e') => self.sidebar_open = !self.sidebar_open,
-                KeyCode::Char(':') => {
-                    self.cmd.clear();
-                    self.mode = Mode::Command;
-                }
-                KeyCode::Char('q') => self.should_quit = true,
-                KeyCode::Char('c') if ctrl => self.should_quit = true,
-                _ => {}
-            }
-            return;
-        }
         match k.code {
-            KeyCode::Char('c') if ctrl => self.should_quit = true,
-            KeyCode::Char('h') if ctrl => self.focus_dir(Dir::Left),
-            KeyCode::Char('l') if ctrl => self.focus_dir(Dir::Right),
-            KeyCode::Char('j') if ctrl => {
-                if self.focus == Focus::Sidebar {
-                    self.sidebar_move(1)
-                } else {
-                    self.focus_dir(Dir::Down)
+            // Esc/Ctrl-C while a turn runs = interrupt (Claude Code muscle
+            // memory). Ctrl-C when idle asks to quit.
+            KeyCode::Esc => {
+                if self.chat.in_flight {
+                    self.interrupt();
                 }
             }
-            KeyCode::Char('k') if ctrl => {
-                if self.focus == Focus::Sidebar {
-                    self.sidebar_move(-1)
+            KeyCode::Char('c') if ctrl => {
+                if self.chat.in_flight {
+                    self.interrupt();
                 } else {
-                    self.focus_dir(Dir::Up)
+                    self.confirm_quit();
                 }
             }
-            KeyCode::Char('e') if ctrl => self.focus_sidebar(),
             KeyCode::Char('d') if ctrl => self.scroll_down(8),
             KeyCode::Char('u') if ctrl => self.scroll_up(8),
+            KeyCode::Char('v') if ctrl => self.paste_from_clipboard(),
             KeyCode::Char(' ') => self.pending = Pending::Leader,
             KeyCode::Char(':') => {
                 self.cmd.clear();
                 self.mode = Mode::Command;
             }
-            KeyCode::Char('i') => {
-                self.focus = Focus::Main;
+            KeyCode::Char('i') | KeyCode::Char('a') => {
                 self.mode = Mode::Insert;
-                self.cur_chat_mut().follow = true;
             }
-            KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Char('H') => self.pane_cycle(-1),
-            KeyCode::Char('L') => self.pane_cycle(1),
+            KeyCode::Char('o') => {
+                self.chat.follow = true;
+                self.mode = Mode::Insert;
+            }
+            KeyCode::Char('q') => self.confirm_quit(),
+            KeyCode::Char('r') => {
+                self.rename_buf = if is_default_name(&self.chat.title) {
+                    String::new()
+                } else {
+                    self.chat.title.clone()
+                };
+                self.mode = Mode::Rename;
+            }
+            KeyCode::Char('?') => self.help_open = true,
             KeyCode::Char('g') => self.pending = Pending::G,
             KeyCode::Char('z') => self.pending = Pending::Z,
-            KeyCode::Char('G') => self.cur_chat_mut().follow = true,
-            KeyCode::Char('n') => {
-                self.new_space();
-                self.focus = Focus::Main;
-                self.mode = Mode::Insert;
-            }
-            KeyCode::Char('a') if self.focus == Focus::Sidebar => self.new_named_space(),
-            KeyCode::Char('r') => self.rename_start(),
-            KeyCode::Char('s') if self.focus == Focus::Sidebar => self.toggle_select(),
-            KeyCode::Char('m') if self.focus == Focus::Sidebar => self.merge_selected(),
-            KeyCode::Char('d') if self.focus == Focus::Sidebar => self.request_delete(),
-            KeyCode::Char('}') => {
-                if self.focus == Focus::Sidebar {
-                    self.sidebar_move(5)
-                } else {
-                    self.scroll_down(10)
-                }
-            }
-            KeyCode::Char('{') => {
-                if self.focus == Focus::Sidebar {
-                    self.sidebar_move(-5)
-                } else {
-                    self.scroll_up(10)
-                }
-            }
-            KeyCode::Char('j') | KeyCode::Down => {
-                if self.focus == Focus::Sidebar {
-                    self.sidebar_move(1)
-                } else {
-                    self.scroll_down(1)
-                }
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                if self.focus == Focus::Sidebar {
-                    self.sidebar_move(-1)
-                } else {
-                    self.scroll_up(1)
-                }
-            }
-            KeyCode::Left => self.focus_dir(Dir::Left),
-            KeyCode::Right => {
-                if self.focus == Focus::Sidebar {
-                    self.activate_selected()
-                } else {
-                    self.focus_dir(Dir::Right)
-                }
-            }
-            KeyCode::Enter => {
-                // Enter only activates a space from the sidebar; no-op in a pane
-                if self.focus == Focus::Sidebar {
-                    self.activate_selected()
-                }
-            }
-            KeyCode::Tab => self.pane_cycle(1),
-            KeyCode::BackTab => self.pane_cycle(-1),
+            KeyCode::Char('G') => self.chat.follow = true,
+            KeyCode::Char('}') => self.scroll_down(10),
+            KeyCode::Char('{') => self.scroll_up(10),
+            KeyCode::Char('j') | KeyCode::Down => self.scroll_down(1),
+            KeyCode::Char('k') | KeyCode::Up => self.scroll_up(1),
+            KeyCode::PageDown => self.scroll_down(12),
+            KeyCode::PageUp => self.scroll_up(12),
             _ => {}
         }
     }
@@ -902,207 +1304,50 @@ impl App {
         match self.pending {
             Pending::G => {
                 self.pending = Pending::None;
-                match k.code {
-                    KeyCode::Char('g') => {
-                        let c = self.cur_chat_mut();
-                        c.follow = false;
-                        c.scroll = 0;
-                    }
-                    KeyCode::Char('t') => self.pane_cycle(1),
-                    KeyCode::Char('T') => self.pane_cycle(-1),
-                    _ => {}
+                if let KeyCode::Char('g') = k.code {
+                    self.chat.follow = false;
+                    self.chat.scroll = 0;
                 }
             }
             Pending::Z => {
                 self.pending = Pending::None;
-                if let KeyCode::Char('z') = k.code {
-                    // recenter on the newest activity (the working line)
-                    self.cur_chat_mut().follow = true;
-                }
-            }
-            Pending::Leader => match k.code {
-                KeyCode::Char('e') => self.pending = Pending::LeaderE,
-                KeyCode::Char('z') => self.pending = Pending::LeaderZ,
-                KeyCode::Char('n') => self.pending = Pending::LeaderN,
-                KeyCode::Char('s') => self.pending = Pending::LeaderS,
-                KeyCode::Char('t') => self.pending = Pending::LeaderT,
-                KeyCode::Char('a') => {
-                    self.pending = Pending::None;
-                    self.new_named_space();
-                }
-                KeyCode::Char(d @ '0'..='9') => {
-                    self.pending = Pending::None;
-                    self.leader_jump(d);
-                }
-                _ => self.pending = Pending::None,
-            },
-            Pending::LeaderS => {
-                self.pending = Pending::None;
                 match k.code {
-                    KeyCode::Char('c') => self.open_picker(),
-                    KeyCode::Char('n') => self.add_chat_to_active(),
-                    KeyCode::Char('p') => self.pop_chat(),
-                    KeyCode::Char('x') => self.close_focused_pane(),
-                    KeyCode::Char('v') => self.spaces[self.active_space].split_dir = SplitDir::V,
-                    KeyCode::Char('h') => self.spaces[self.active_space].split_dir = SplitDir::H,
-                    KeyCode::Char('m') => {
-                        let z = self.spaces[self.active_space].zoom;
-                        self.spaces[self.active_space].zoom = !z;
+                    KeyCode::Char('z') => {
+                        // recenter on the newest activity (the working line)
+                        self.chat.follow = true;
+                    }
+                    KeyCode::Char('a') => {
+                        // za — vim fold toggle: expand/collapse tool results
+                        self.chat.expand_tools = !self.chat.expand_tools;
                     }
                     _ => {}
                 }
             }
-            Pending::LeaderT => {
+            Pending::Leader => {
                 self.pending = Pending::None;
                 match k.code {
-                    KeyCode::Char('n') => self.add_chat_to_active(),
-                    KeyCode::Char('o') | KeyCode::Char('f') => {
-                        self.new_space();
-                        self.mode = Mode::Insert;
-                    }
-                    KeyCode::Char('x') => self.close_focused_pane(),
+                    KeyCode::Char('z') => self.help_open = true, // Space z(z)
+                    KeyCode::Char('e') => self.chat.expand_tools = !self.chat.expand_tools,
                     _ => {}
-                }
-            }
-            Pending::LeaderE => {
-                self.pending = Pending::None;
-                match k.code {
-                    KeyCode::Char('e') => self.toggle_sidebar(),
-                    KeyCode::Char('f') => self.focus_sidebar(),
-                    KeyCode::Char('c') => {
-                        self.sidebar_open = false;
-                        self.focus = Focus::Main;
-                    }
-                    _ => {}
-                }
-            }
-            Pending::LeaderN => {
-                self.pending = Pending::None;
-                match k.code {
-                    KeyCode::Char('c') => self.add_chat_to_active(),
-                    KeyCode::Char('s') => {
-                        self.new_space();
-                    }
-                    _ => {}
-                }
-            }
-            Pending::LeaderZ => {
-                self.pending = Pending::None;
-                if let KeyCode::Char('z') = k.code {
-                    self.help_open = true;
                 }
             }
             Pending::None => {}
         }
     }
 
-    // ---- focus / panes within the active space ----
-
-    fn focus_sidebar(&mut self) {
-        self.focus = Focus::Sidebar;
-        self.sidebar_open = true;
-        self.sidebar_cursor = self.active_space;
-    }
-
-    /// Space e e: toggle sidebar visibility (Space e f focuses it).
-    fn toggle_sidebar(&mut self) {
-        self.sidebar_open = !self.sidebar_open;
-        if !self.sidebar_open && self.focus == Focus::Sidebar {
-            self.focus = Focus::Main;
-        }
-    }
-
-    fn activate_selected(&mut self) {
-        self.active_space = self.sidebar_cursor.min(self.spaces.len().saturating_sub(1));
-        self.focus = Focus::Main;
-    }
-
-    fn focus_dir(&mut self, dir: Dir) {
-        if self.focus == Focus::Sidebar {
-            if let Dir::Right = dir {
-                self.focus = Focus::Main;
-            }
-            return;
-        }
-        let sp = &self.spaces[self.active_space];
-        let n = sp.chats.len();
-        let cur = sp.fi();
-        let target: Option<usize> = if n <= 1 {
-            match dir {
-                Dir::Left => Some(usize::MAX),
-                _ => None,
-            }
-        } else if n == 2 {
-            match (sp.split_dir, dir) {
-                (SplitDir::V, Dir::Left) => Some(if cur == 1 { 0 } else { usize::MAX }),
-                (SplitDir::V, Dir::Right) => (cur == 0).then_some(1),
-                (SplitDir::H, Dir::Up) => (cur == 1).then_some(0),
-                (SplitDir::H, Dir::Down) => (cur == 0).then_some(1),
-                (SplitDir::H, Dir::Left) => Some(usize::MAX),
-                _ => None,
-            }
-        } else if n == 3 {
-            // TL=0, TR=1, bottom=2 (full width)
-            match dir {
-                Dir::Left => match cur {
-                    1 => Some(0),
-                    _ => Some(usize::MAX),
-                },
-                Dir::Right => (cur == 0).then_some(1),
-                Dir::Down => (cur == 0 || cur == 1).then_some(2),
-                Dir::Up => (cur == 2).then_some(0),
-            }
-        } else {
-            // 2x2: TL=0 TR=1 BL=2 BR=3
-            match dir {
-                Dir::Left => match cur {
-                    1 => Some(0),
-                    3 => Some(2),
-                    _ => Some(usize::MAX),
-                },
-                Dir::Right => match cur {
-                    0 => Some(1),
-                    2 => Some(3),
-                    _ => None,
-                },
-                Dir::Up => match cur {
-                    2 => Some(0),
-                    3 => Some(1),
-                    _ => None,
-                },
-                Dir::Down => match cur {
-                    0 => Some(2),
-                    1 => Some(3),
-                    _ => None,
-                },
-            }
-        };
-        match target {
-            Some(usize::MAX) => self.focus_sidebar(),
-            Some(p) if p < n => self.spaces[self.active_space].focused = p,
-            _ => {}
-        }
-    }
-
-    fn pane_cycle(&mut self, d: isize) {
-        let sp = &mut self.spaces[self.active_space];
-        let n = sp.chats.len() as isize;
-        if n < 2 {
-            return;
-        }
-        sp.focused = (sp.fi() as isize + d).rem_euclid(n) as usize;
-    }
-
-    fn scroll_down(&mut self, n: u16) {
-        let c = self.cur_chat_mut();
+    fn scroll_down(&mut self, n: usize) {
+        let c = &mut self.chat;
         if c.follow {
-            c.scroll = c.last_max_scroll;
-            c.follow = false;
+            return; // already pinned to the live tail
         }
         c.scroll = c.scroll.saturating_add(n).min(c.last_max_scroll);
+        // Scrolling back down to the bottom re-engages follow (sticky tail).
+        if c.scroll >= c.last_max_scroll {
+            c.follow = true;
+        }
     }
-    fn scroll_up(&mut self, n: u16) {
-        let c = self.cur_chat_mut();
+    fn scroll_up(&mut self, n: usize) {
+        let c = &mut self.chat;
         if c.follow {
             c.scroll = c.last_max_scroll;
             c.follow = false;
@@ -1110,340 +1355,14 @@ impl App {
         c.scroll = c.scroll.saturating_sub(n);
     }
 
-    fn sidebar_move(&mut self, delta: isize) {
-        let n = self.spaces.len();
-        if n == 0 {
-            return;
-        }
-        let cur = self.sidebar_cursor.min(n - 1) as isize;
-        self.sidebar_cursor = (cur + delta).clamp(0, n as isize - 1) as usize;
-    }
+    // ---- mouse ----
 
-    fn leader_jump(&mut self, d: char) {
-        let idx = if d == '0' { 9 } else { (d as u8 - b'1') as usize };
-        if idx < self.spaces.len() {
-            self.active_space = idx;
-            self.sidebar_cursor = idx;
-            self.focus = Focus::Main;
+    fn handle_mouse(&mut self, m: MouseEvent) {
+        match m.kind {
+            MouseEventKind::ScrollDown => self.scroll_down(3),
+            MouseEventKind::ScrollUp => self.scroll_up(3),
+            _ => {}
         }
-    }
-
-    // ---- space / chat lifecycle ----
-
-    fn next_chat_title(&mut self) -> String {
-        let n = self.chat_counter;
-        self.chat_counter += 1;
-        format!("chat {n}")
-    }
-
-    fn next_space_name(&mut self) -> String {
-        let n = self.space_counter;
-        self.space_counter += 1;
-        if n == 1 {
-            "space".to_string()
-        } else {
-            format!("space {n}")
-        }
-    }
-
-    fn new_space(&mut self) -> usize {
-        let cid = self.next_chat_id;
-        self.next_chat_id += 1;
-        let sid = self.next_space_id;
-        self.next_space_id += 1;
-        let title = self.next_chat_title();
-        let sname = self.next_space_name();
-        let mut c = Chat::fresh(cid);
-        c.title = title;
-        let mut sp = Space::one(sid, c);
-        sp.name = sname;
-        self.spaces.push(sp);
-        self.active_space = self.spaces.len() - 1;
-        self.sidebar_cursor = self.active_space;
-        self.persist();
-        self.active_space
-    }
-
-    fn new_named_space(&mut self) {
-        self.new_space();
-        self.sidebar_open = true;
-        self.focus = Focus::Sidebar;
-        self.rename_target = RenameTarget::Space;
-        self.rename_buf.clear();
-        self.mode = Mode::Rename;
-    }
-
-    fn add_chat_to_active(&mut self) {
-        if self.spaces[self.active_space].chats.len() >= 4 {
-            return;
-        }
-        let cid = self.next_chat_id;
-        self.next_chat_id += 1;
-        let title = self.next_chat_title();
-        {
-            let sp = &mut self.spaces[self.active_space];
-            let mut c = Chat::fresh(cid);
-            c.title = title;
-            sp.chats.push(c);
-            sp.focused = sp.chats.len() - 1;
-            sp.zoom = false;
-        }
-        self.focus = Focus::Main;
-        self.persist();
-    }
-
-    fn pop_chat(&mut self) {
-        let ai = self.active_space;
-        if self.spaces[ai].chats.len() <= 1 {
-            return;
-        }
-        let chat = {
-            let sp = &mut self.spaces[ai];
-            let f = sp.fi();
-            let chat = sp.chats.remove(f);
-            if sp.focused >= sp.chats.len() {
-                sp.focused = sp.chats.len() - 1;
-            }
-            sp.zoom = false;
-            chat
-        };
-        let sid = self.next_space_id;
-        self.next_space_id += 1;
-        let sname = self.next_space_name();
-        let mut sp = Space::one(sid, chat);
-        sp.name = sname;
-        self.spaces.push(sp);
-        self.active_space = self.spaces.len() - 1;
-        self.sidebar_cursor = self.active_space;
-        self.focus = Focus::Main;
-        self.persist();
-    }
-
-    fn close_focused_pane(&mut self) {
-        let ai = self.active_space;
-        if self.spaces[ai].chats.len() <= 1 {
-            self.delete_space_at(ai);
-        } else {
-            let sp = &mut self.spaces[ai];
-            let f = sp.fi();
-            sp.chats.remove(f);
-            if sp.focused >= sp.chats.len() {
-                sp.focused = sp.chats.len() - 1;
-            }
-            sp.zoom = false;
-        }
-        self.persist();
-    }
-
-    fn delete_space_at(&mut self, i: usize) {
-        if i >= self.spaces.len() {
-            return;
-        }
-        self.spaces.remove(i);
-        if self.spaces.is_empty() {
-            self.active_space = 0;
-            self.sidebar_cursor = 0;
-            return; // empty — "start a space" state
-        }
-        if self.active_space >= self.spaces.len() {
-            self.active_space = self.spaces.len() - 1;
-        }
-        if self.sidebar_cursor >= self.spaces.len() {
-            self.sidebar_cursor = self.spaces.len() - 1;
-        }
-    }
-
-    fn toggle_select(&mut self) {
-        if let Some(id) = self.sel_space_id() {
-            if let Some(pos) = self.selected.iter().position(|&x| x == id) {
-                self.selected.remove(pos);
-            } else {
-                self.selected.push(id);
-            }
-        }
-    }
-
-    /// Merge the selected spaces into the first — chats combined (≤4), sources
-    /// removed. Name defaults to the first space's name.
-    fn merge_selected(&mut self) {
-        if self.selected.len() < 2 {
-            return;
-        }
-        let ids = self.selected.clone();
-        let total: usize = ids
-            .iter()
-            .filter_map(|&id| self.space_index(id))
-            .map(|i| self.spaces[i].chats.len())
-            .sum();
-        if total > 4 {
-            self.cur_chat_mut()
-                .transcript
-                .push(Entry::Note("can't merge — would exceed 4 chats in a space".into()));
-            self.selected.clear();
-            return;
-        }
-        let target_name = self
-            .space_index(ids[0])
-            .map(|i| space_name(&self.spaces[i]))
-            .unwrap_or_default();
-        let mut moved: Vec<Chat> = Vec::new();
-        for &oid in &ids[1..] {
-            if let Some(oi) = self.space_index(oid) {
-                let sp = self.spaces.remove(oi);
-                moved.extend(sp.chats);
-            }
-        }
-        if let Some(ti) = self.space_index(ids[0]) {
-            self.spaces[ti].name = target_name;
-            self.spaces[ti].chats.extend(moved);
-            self.active_space = ti;
-            self.sidebar_cursor = ti;
-        }
-        self.selected.clear();
-        if self.active_space >= self.spaces.len() {
-            self.active_space = self.spaces.len() - 1;
-        }
-        if self.sidebar_cursor >= self.spaces.len() {
-            self.sidebar_cursor = self.spaces.len() - 1;
-        }
-        self.persist();
-    }
-
-    fn merge_space_into_active(&mut self, other_id: u64) {
-        let ai = self.active_space;
-        let a_id = self.spaces[ai].id;
-        if other_id == a_id {
-            return;
-        }
-        let Some(oi) = self.space_index(other_id) else {
-            return;
-        };
-        if self.spaces[ai].chats.len() + self.spaces[oi].chats.len() > 4 {
-            self.cur_chat_mut()
-                .transcript
-                .push(Entry::Note("can't merge — would exceed 4 chats in a space".into()));
-            return;
-        }
-        let sp = self.spaces.remove(oi);
-        let ai2 = self.space_index(a_id).unwrap_or(0);
-        self.spaces[ai2].chats.extend(sp.chats);
-        self.active_space = ai2;
-        self.sidebar_cursor = ai2;
-        self.persist();
-    }
-
-    fn request_delete(&mut self) {
-        let ids: Vec<u64> = if !self.selected.is_empty() {
-            self.selected.clone()
-        } else if let Some(id) = self.sel_space_id() {
-            vec![id]
-        } else {
-            return;
-        };
-        let n = ids.len();
-        self.confirm_msg = if n == 1 {
-            let name = self
-                .space_index(ids[0])
-                .map(|i| space_name(&self.spaces[i]))
-                .unwrap_or_default();
-            format!("delete space \"{name}\"?   y / n")
-        } else {
-            format!("delete {n} spaces?   y / n")
-        };
-        self.pending_delete = ids;
-        self.mode = Mode::Confirm;
-    }
-
-    fn rename_start(&mut self) {
-        if self.focus == Focus::Main {
-            // rename the focused chat (input shows in the composer)
-            self.rename_target = RenameTarget::Chat;
-            let ai = self.active_space;
-            let fi = self.spaces[ai].fi();
-            self.rename_buf = self.spaces[ai].chats[fi].title.clone();
-        } else {
-            // rename the space (inline in the sidebar)
-            self.rename_target = RenameTarget::Space;
-            let idx = self.sidebar_cursor.min(self.spaces.len().saturating_sub(1));
-            self.sidebar_open = true;
-            self.focus = Focus::Sidebar;
-            self.sidebar_cursor = idx;
-            self.rename_buf = self.spaces[idx].name.clone();
-        }
-        self.mode = Mode::Rename;
-    }
-
-    fn rename_commit(&mut self) {
-        match self.rename_target {
-            RenameTarget::Space => {
-                let idx = self.sidebar_cursor.min(self.spaces.len().saturating_sub(1));
-                self.spaces[idx].name = self.rename_buf.trim().to_string();
-            }
-            RenameTarget::Chat => {
-                let ai = self.active_space;
-                let fi = self.spaces[ai].fi();
-                let name = self.rename_buf.trim().to_string();
-                if !name.is_empty() {
-                    self.spaces[ai].chats[fi].title = name;
-                    self.spaces[ai].chats[fi].autonamed = true;
-                }
-            }
-        }
-        self.mode = Mode::Normal;
-        self.persist();
-    }
-
-    // ---- picker (Space s c — merge a space in, or type a new chat name) ----
-
-    fn open_picker(&mut self) {
-        self.picker_query.clear();
-        self.picker_sel = 0;
-        self.mode = Mode::Picker;
-    }
-
-    pub fn picker_candidates(&self) -> Vec<usize> {
-        let q = self.picker_query.to_lowercase();
-        self.spaces
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| *i != self.active_space)
-            .filter(|(_, sp)| q.is_empty() || space_name(sp).to_lowercase().contains(&q))
-            .map(|(i, _)| i)
-            .collect()
-    }
-
-    fn picker_down(&mut self) {
-        let n = self.picker_candidates().len();
-        if n > 0 {
-            self.picker_sel = (self.picker_sel + 1).min(n - 1);
-        }
-    }
-    fn picker_up(&mut self) {
-        self.picker_sel = self.picker_sel.saturating_sub(1);
-    }
-
-    fn picker_commit(&mut self) {
-        let cands = self.picker_candidates();
-        if let Some(&si) = cands.get(self.picker_sel) {
-            let other = self.spaces[si].id;
-            self.merge_space_into_active(other);
-        } else {
-            // no match → add a new chat named the query to the active space
-            let q = self.picker_query.trim().to_string();
-            if !q.is_empty() && self.spaces[self.active_space].chats.len() < 4 {
-                let cid = self.next_chat_id;
-                self.next_chat_id += 1;
-                let mut c = Chat::fresh(cid);
-                c.title = slug(&q);
-                c.autonamed = true;
-                let sp = &mut self.spaces[self.active_space];
-                sp.chats.push(c);
-                sp.focused = sp.chats.len() - 1;
-                self.persist();
-            }
-        }
-        self.focus = Focus::Main;
-        self.mode = Mode::Normal;
     }
 
     fn exec_command(&mut self) {
@@ -1451,158 +1370,387 @@ impl App {
         self.cmd.clear();
         self.mode = Mode::Normal;
         match cmd.as_str() {
-            "q" | "quit" => {
+            "q" | "q!" | "qa" | "qa!" | "quit" => {
+                // Explicit :q is deliberate — no extra confirm.
                 self.should_quit = true;
-                return;
             }
-            "new" => {
-                self.new_space();
-                self.mode = Mode::Insert;
-                return;
+            "w" | "ws" | "write" => self.persist(),
+            "clear" => self.reset_conversation(),
+            "help" => self.help_open = true,
+            "rename" => {
+                self.rename_buf = if is_default_name(&self.chat.title) {
+                    String::new()
+                } else {
+                    self.chat.title.clone()
+                };
+                self.mode = Mode::Rename;
             }
-            "w" | "ws" | "write" => {
-                self.persist();
-                return;
-            }
-            _ => {}
-        }
-        if self.spaces.is_empty() {
-            return;
-        }
-        match cmd.as_str() {
-            "close" => self.close_focused_pane(),
-            "pop" => self.pop_chat(),
-            "vsplit" | "vs" => self.spaces[self.active_space].split_dir = SplitDir::V,
-            "split" | "sp" => self.spaces[self.active_space].split_dir = SplitDir::H,
-            _ => {}
+            "mouse" | "mouse toggle" => self.toggle_mouse(),
+            "mouse on" => self.set_mouse(true),
+            "mouse off" => self.set_mouse(false),
+            "" => {}
+            // Unknown commands used to vanish silently (:wq, :help → nothing).
+            other => self.toast = Some(format!("not a command: :{other}")),
         }
     }
 
-    fn env_prompt_for(&self, si: usize, ci: usize) -> String {
+    fn env_prompt(&self) -> String {
         let cwd = std::env::current_dir()
             .map(|p| p.display().to_string())
             .unwrap_or_default();
-        let me = chat_title(&self.spaces[si].chats[ci]);
-        let my_space = space_name(&self.spaces[si]);
-        let others: Vec<String> = self
-            .spaces
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| *i != si)
-            .map(|(_, sp)| space_name(sp))
-            .collect();
-        let pipe = std::env::var("AEOVIM_PIPE").ok();
-        let pipe_instr = match &pipe {
-            Some(p) if !others.is_empty() => format!(
-                " You can message another space's agent by appending ONE JSON line to the pipe at {p}, e.g.  echo '{{\"to\":\"<space name>\",\"from\":\"{my_space}\",\"message\":\"...\"}}' >> {p}  — only when you genuinely need to coordinate with another agent. Spaces you can message: [{}].",
-                others.join(", ")
-            ),
-            _ => String::new(),
-        };
         format!(
-            "You are running inside aeovim — a keyboard-driven, multi-agent terminal UI that wraps the Claude Code CLI. \
-You are the agent \"{me}\" in the space \"{my_space}\". The user may run several agents in parallel.{pipe_instr} \
-Working directory: {cwd}. You're in a terminal on macOS (tmux/Ghostty) — keep output concise and terminal-friendly."
+            "You are running inside aeovim — a keyboard-driven terminal UI that wraps the \
+Claude Code CLI. Working directory: {cwd}. You're in a terminal on macOS \
+(tmux/Ghostty) — keep output concise and terminal-friendly."
         )
     }
 
-    /// Push a user prompt to a specific chat and spawn its turn.
-    fn spawn_for(&mut self, si: usize, ci: usize, prompt: String) {
-        if si >= self.spaces.len() || ci >= self.spaces[si].chats.len() {
-            return;
+    /// Make sure the chat has a live session child, spawning one if needed.
+    /// Returns false if the spawn failed (an Error entry is pushed).
+    fn ensure_session(&mut self) -> bool {
+        if self.chat.session.as_ref().is_some_and(|s| s.is_alive()) {
+            return true;
         }
-        if self.spaces[si].chats[ci].in_flight {
-            return;
-        }
-        let dangerous = self.dangerous;
-        let model = self.model_cli.clone();
-        let tx = self.tx.clone();
-        let sysp = self.env_prompt_for(si, ci);
-        let sname = space_name(&self.spaces[si]);
-        let pipe = std::env::var("AEOVIM_PIPE").ok();
-        let spec = {
-            let c = &mut self.spaces[si].chats[ci];
-            c.transcript.push(Entry::User(prompt.clone()));
-            c.streaming = None;
-            c.in_flight = true;
-            c.follow = true;
-            let spec = TurnSpec {
-                chat: c.id,
-                prompt,
-                session_id: c.session_id.clone(),
-                first: c.first_turn,
-                model,
-                dangerous,
-                permission_mode: "acceptEdits".into(),
-                append_system_prompt: Some(sysp),
-                space_name: sname,
-                pipe_path: pipe,
-            };
-            c.first_turn = false;
-            spec
+        let spec = crate::agent::SessionSpec {
+            chat: CHAT_ID,
+            session_id: self.chat.session_id.clone(),
+            resume: !self.chat.first_turn,
+            model: self.model_cli.clone(),
+            dangerous: self.dangerous,
+            permission_mode: "acceptEdits".into(),
+            append_system_prompt: Some(self.env_prompt()),
         };
-        spawn_turn(spec, tx);
+        match crate::agent::spawn_session(spec, self.tx.clone()) {
+            Ok(h) => {
+                self.chat.session = Some(h);
+                self.chat.first_turn = false;
+                true
+            }
+            Err(e) => {
+                self.chat.push(Entry::Error(e.to_string()));
+                false
+            }
+        }
+    }
+
+    /// Deliver a prompt as a turn on the live session. Assumes the user entry
+    /// (if any) is already on the transcript — the resume self-heal replays
+    /// through here without re-pushing it.
+    fn deliver(&mut self, prompt: String, snap_to_bottom: bool) {
+        if !self.ensure_session() {
+            return;
+        }
+        let c = &mut self.chat;
+        let sent = c
+            .session
+            .as_ref()
+            .map(|s| s.send_user_turn(&prompt))
+            .unwrap_or(false);
+        if !sent {
+            c.session = None;
+            c.push(Entry::Error("session is gone — try again".into()));
+            return;
+        }
+        c.streaming = None;
+        c.in_flight = true;
+        c.interrupting = false;
+        if snap_to_bottom {
+            c.follow = true; // sending is a user action; jump to the live tail
+        }
+        c.turn_started = Some(Instant::now());
+        c.activity = Some("Thinking".into());
+    }
+
+    /// Interrupt the in-flight turn. First press asks the child nicely (control
+    /// protocol — keeps the session alive); a second press while still
+    /// interrupting hard-kills the child.
+    fn interrupt(&mut self) {
+        let c = &mut self.chat;
+        if !c.in_flight {
+            return;
+        }
+        if c.interrupting {
+            if let Some(s) = &c.session {
+                s.kill();
+            }
+            return;
+        }
+        let asked = c.session.as_ref().map(|s| s.send_interrupt()).unwrap_or(false);
+        if asked {
+            c.interrupting = true;
+            c.activity = Some("Interrupting… (Esc again to force)".into());
+        } else if let Some(s) = &c.session {
+            s.kill();
+        } else {
+            // No live child (shouldn't happen while in_flight) — clear the state.
+            c.in_flight = false;
+            c.turn_started = None;
+            c.activity = None;
+        }
+    }
+
+    /// Stop the live child (used on quit so nothing runs on invisibly).
+    pub fn kill_all_sessions(&mut self) {
+        if let Some(s) = self.chat.session.take() {
+            s.kill();
+        }
+    }
+
+    /// /clear · :clear — wipe the transcript and start a fresh claude session.
+    fn reset_conversation(&mut self) {
+        let c = &mut self.chat;
+        if let Some(s) = c.session.take() {
+            s.kill();
+        }
+        c.clear_transcript();
+        c.note("cleared — fresh session");
+        c.streaming = None;
+        c.in_flight = false;
+        c.interrupting = false;
+        c.turn_started = None;
+        c.activity = None;
+        c.queue.clear();
+        c.cost = 0.0;
+        c.first_turn = true;
+        c.session_id = Uuid::new_v4().to_string();
         self.persist();
     }
 
+    /// Insert pasted text into whatever's being edited. In the composer the
+    /// newlines are preserved (the box grows); single-line fields flatten
+    /// newlines to spaces. A paste in Normal mode drops into the composer so
+    /// "I pasted" just works.
+    fn paste(&mut self, raw: String) {
+        let text = sanitize_paste(&raw);
+        if text.is_empty() {
+            return;
+        }
+        let flat = || text.replace('\n', " ");
+        match self.mode {
+            Mode::Insert => self.insert_at_cursor(&text),
+            Mode::Command => self.cmd.push_str(&flat()),
+            Mode::Rename => self.rename_buf.push_str(&flat()),
+            Mode::Normal => {
+                self.mode = Mode::Insert;
+                self.chat.follow = true;
+                self.insert_at_cursor(&text);
+            }
+            Mode::Confirm => {}
+        }
+    }
+
+    /// Explicit clipboard paste (Ctrl-v) — reads `pbpaste` for terminals/tmux
+    /// setups that don't forward bracketed paste. Runs on its own thread so a
+    /// slow clipboard can't freeze the UI; the text arrives as `Msg::Pasted`.
+    fn paste_from_clipboard(&mut self) {
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            if let Ok(out) = std::process::Command::new("pbpaste").output() {
+                if let Ok(s) = String::from_utf8(out.stdout) {
+                    if !s.is_empty() {
+                        let _ = tx.send(Msg::Pasted(s));
+                    }
+                }
+            }
+        });
+    }
+
+    /// Send the composed prompt. Stays in Insert mode — the natural next action
+    /// after sending is typing the follow-up.
     fn send_prompt(&mut self) {
         let prompt = self.input.trim().to_string();
-        if prompt.is_empty() || self.spaces.is_empty() {
+        if prompt.is_empty() {
             return;
         }
-        let ai = self.active_space;
-        let fi = self.spaces[ai].fi();
-        // /clear: wipe the transcript and start a fresh claude session
         if prompt == "/clear" {
-            let c = &mut self.spaces[ai].chats[fi];
-            c.transcript.clear();
-            c.transcript.push(Entry::Note("cleared".into()));
-            c.streaming = None;
-            c.cost = 0.0;
-            c.first_turn = true;
-            c.session_id = Uuid::new_v4().to_string();
             self.input.clear();
-            self.mode = Mode::Normal;
-            self.persist();
-            return;
-        }
-        if self.spaces[ai].chats[fi].in_flight {
+            self.input_cursor = 0;
+            self.reset_conversation();
             return;
         }
         self.input.clear();
-        self.mode = Mode::Normal;
-        self.spawn_for(ai, fi, prompt);
+        self.input_cursor = 0;
+        self.slash_sel = 0;
+        // Busy? Queue it (shown at the bottom) and send it when the turn frees
+        // up — turns on one session are strictly sequential.
+        if self.chat.in_flight {
+            self.chat.queue.push(prompt);
+            self.chat.follow = true;
+            return;
+        }
+        {
+            let c = &mut self.chat;
+            c.push(Entry::User(prompt.clone()));
+            c.last_prompt = Some(prompt.clone());
+            c.healed_once = false;
+            // Name the conversation off its first prompt.
+            if is_default_name(&c.title) {
+                c.title = slug(&prompt);
+            }
+        }
+        self.deliver(prompt, true);
     }
 
-    /// A message arrived over the pipe from another agent — deliver it to the
-    /// named space's focused chat and let that agent respond (shown in the UI).
-    fn inject_pipe(&mut self, to: String, from: String, message: String) {
-        if self.spaces.is_empty() {
+    /// A turn just ended — if prompts were queued while it ran, send the next
+    /// one. Runs one at a time; the following turn's end drains the rest.
+    fn drain_queue(&mut self) {
+        if self.chat.in_flight || self.chat.queue.is_empty() {
             return;
         }
-        let target = self
-            .spaces
+        let next = self.chat.queue.remove(0);
+        {
+            let c = &mut self.chat;
+            c.push(Entry::User(next.clone()));
+            c.last_prompt = Some(next.clone());
+            c.healed_once = false;
+        }
+        self.deliver(next, false);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn render(lines: &[DiffLine]) -> String {
+        lines
             .iter()
-            .position(|sp| space_name(sp).eq_ignore_ascii_case(to.trim()));
-        let Some(si) = target else {
-            self.cur_chat_mut()
-                .transcript
-                .push(Entry::Note(format!("pipe: no space named \"{to}\"")));
-            return;
-        };
-        let ci = self.spaces[si].fi();
-        let who = if from.trim().is_empty() {
-            "another agent".to_string()
-        } else {
-            from.trim().to_string()
-        };
-        if self.spaces[si].chats[ci].in_flight {
-            self.spaces[si].chats[ci]
-                .transcript
-                .push(Entry::Note(format!("pipe from {who} (queued — busy): {message}")));
-            return;
-        }
-        let prompt = format!("[message from space \"{who}\" via aeovim pipe]\n{message}");
-        self.spawn_for(si, ci, prompt);
+            .map(|l| {
+                let m = match l.kind {
+                    DiffKind::Add => '+',
+                    DiffKind::Del => '-',
+                    DiffKind::Gap => '~',
+                    DiffKind::Ctx => ' ',
+                };
+                format!("{m}{}", l.text)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn diff_changes_one_line() {
+        let (added, removed, lines) = line_diff("a\nb\nc", "a\nB\nc");
+        assert_eq!((added, removed), (1, 1));
+        // context a/c kept, b→B shown as -/+
+        assert_eq!(render(&lines), " a\n-b\n+B\n c");
+    }
+
+    #[test]
+    fn diff_pure_insert_from_write() {
+        let (added, removed, lines) = line_diff("", "one\ntwo");
+        assert_eq!((added, removed), (2, 0));
+        assert!(lines.iter().all(|l| l.kind == DiffKind::Add));
+    }
+
+    #[test]
+    fn collapse_inserts_gap_for_long_context() {
+        // 10 unchanged lines then a change — the middle context collapses to a gap.
+        let old: String = (0..10).map(|i| format!("l{i}\n")).collect::<String>() + "x";
+        let new: String = (0..10).map(|i| format!("l{i}\n")).collect::<String>() + "y";
+        let (_, _, lines) = line_diff(&old, &new);
+        assert!(lines.iter().any(|l| l.kind == DiffKind::Gap));
+        // the change survives the collapse
+        assert!(lines.iter().any(|l| l.kind == DiffKind::Del && l.text == "x"));
+        assert!(lines.iter().any(|l| l.kind == DiffKind::Add && l.text == "y"));
+    }
+
+    #[test]
+    fn paste_keeps_newlines_drops_escapes() {
+        // CRLF → LF, tab → spaces, embedded ESC/control dropped, newlines kept.
+        let out = sanitize_paste("a\r\nb\tc\x1b[31m\nd");
+        assert_eq!(out, "a\nb    c\nd");
+        // a multi-line paste stays multi-line (would previously send on line 1)
+        assert_eq!(sanitize_paste("one\ntwo\nthree").lines().count(), 3);
+    }
+
+    #[test]
+    fn tool_results_land_under_their_calls() {
+        // Two parallel tool calls; results arrive OUT of order — each must
+        // still render under its own ● header (the old code appended blindly).
+        let mut c = Chat::blank("sid".into(), "t".into(), true, 0.0);
+        c.push(Entry::User("go".into()));
+        let a_idx = c.transcript.len();
+        c.push(Entry::Tool("● Bash(ls)".into()));
+        c.pending_tools.push(("tool_a".into(), a_idx));
+        let b_idx = c.transcript.len();
+        c.push(Entry::Tool("● Grep(x)".into()));
+        c.pending_tools.push(("tool_b".into(), b_idx));
+
+        c.insert_tool_result("tool_b", true, "grep out".into());
+        c.insert_tool_result("tool_a", true, "ls out".into());
+
+        let texts: Vec<String> = c
+            .transcript
+            .iter()
+            .map(|e| match e {
+                Entry::User(x) | Entry::Tool(x) => x.clone(),
+                Entry::ToolResult { text, .. } => format!("⎿{text}"),
+                _ => "?".into(),
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["go", "● Bash(ls)", "⎿ls out", "● Grep(x)", "⎿grep out"]
+        );
+        assert!(c.pending_tools.is_empty());
+    }
+
+    #[test]
+    fn unknown_tool_result_appends() {
+        let mut c = Chat::blank("sid".into(), "t".into(), true, 0.0);
+        c.push(Entry::User("go".into()));
+        c.insert_tool_result("mystery", false, "boom".into());
+        assert!(matches!(
+            c.transcript.last(),
+            Some(Entry::ToolResult { ok: false, .. })
+        ));
+    }
+
+    #[test]
+    fn cap_tool_text_keeps_head_and_tail() {
+        let big: String = (0..1000).map(|i| format!("line{i}\n")).collect();
+        let capped = cap_tool_text(&big);
+        assert!(capped.contains("line0"));
+        assert!(capped.contains("line999"));
+        assert!(capped.contains("lines omitted"));
+        assert!(capped.len() < big.len());
+        // small results pass through untouched
+        assert_eq!(cap_tool_text("ok\ndone"), "ok\ndone");
+    }
+
+    #[test]
+    fn grapheme_helpers_never_split_emoji() {
+        let s = "a👩‍👩‍👧‍👦b"; // family emoji is one grapheme, many bytes
+        let after_a = 1;
+        let after_emoji = next_grapheme(s, after_a);
+        assert_eq!(&s[after_emoji..], "b");
+        assert_eq!(prev_grapheme(s, after_emoji), after_a);
+        assert_eq!(prev_grapheme(s, 0), 0);
+        assert_eq!(next_grapheme(s, s.len()), s.len());
+    }
+
+    #[test]
+    fn clean_line_strips_bidi_and_escapes() {
+        assert_eq!(clean_line("ok\u{202E}evil"), "okevil");
+        assert_eq!(clean_line("a\x1b[31mred\x1b[0m"), "ared");
+        // a stray ESC before unicode text must not eat the next char
+        assert_eq!(clean_line("\u{1b}日本"), "日本");
+    }
+
+    #[test]
+    fn build_diff_edit_and_write() {
+        let edit = serde_json::json!({
+            "file_path": "/tmp/x.rs", "old_string": "foo", "new_string": "bar"
+        });
+        let (file, a, r, _) = build_diff("Edit", &edit).unwrap();
+        assert_eq!((a, r), (1, 1));
+        assert!(file.ends_with("x.rs"));
+
+        let write = serde_json::json!({ "file_path": "/tmp/y.rs", "content": "l1\nl2\nl3" });
+        let (_, a, r, _) = build_diff("Write", &write).unwrap();
+        assert_eq!((a, r), (3, 0));
+
+        assert!(build_diff("Bash", &serde_json::json!({"command":"ls"})).is_none());
     }
 }

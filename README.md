@@ -2,36 +2,35 @@
 
 *vim, but the buffers are live coding agents and the operators drive them.*
 
-**aeovim** is a standalone, keyboard-native Rust TUI for multiplexing and orchestrating LLM coding agents. It applies the Neovim mental model — modes, motions, buffers, tabs, splits — to conversations with coding agents, so spawning, steering, watching, and reviewing many agents at once is muscle memory rather than window juggling.
+**aeovim** is a standalone, keyboard-native Rust TUI for talking to a coding agent. It applies the Neovim mental model — Insert to talk, Normal to read and steer — to one conversation with Claude Code, DeepSeek-TUI style: launch it and you're typing; everything on one clean surface. Multiplexing happens where it already lives — tmux; one `avim` per pane, each with its own persistent session.
 
 The project is **aeovim**; the command you run is **`avim`** (like Neovim → `nvim`).
 
-v1 wraps the `claude` CLI (Claude Code) as child processes over headless `stream-json`. It reuses Claude Code's own auth, tools, permissions, skills, and MCP servers — it doesn't re-implement any of that. All backend detail sits behind an `AgentBackend` seam so other models/CLIs (or a direct API) can drop in later. Single-user, local macOS daily driver. Not distributed.
+It wraps the `claude` CLI (Claude Code) as one long-lived child over headless `stream-json`. It reuses Claude Code's own auth, tools, permissions, skills, and MCP servers — it doesn't re-implement any of that. Single-user, local macOS daily driver. Not distributed.
 
 ## Status
 
-**Working walking skeleton — installable and in daily use.** ~3,200 lines of Rust across seven modules; builds, installs, and drives real multi-turn Claude Code sessions. This is well past the "pre-implementation" the earlier README claimed. The orchestration layer (fan-out, job board, diff review) is designed but not yet built — see the split below.
+**Usable daily driver (2026-08 rebuild, single-session).** ~4,000 lines of Rust plus a PTY test harness. The 2026-08 pass replaced the one-child-per-turn skeleton with a long-lived session model, fixed the input/rendering/persistence defects that made the skeleton unusable, then collapsed the experimental spaces/panes layer into one clean conversation per launch.
 
 ### What works today
 
-- **Modal TUI** with a Space-leader keymap + which-key popup, ported from the author's Neovim config (nvim-tree / harpoon / bufferline / lualine / which-key). Lilac theme.
-- **Two-level model:** a **Space** is a named container of 1–4 **Chats**. The sidebar lists Spaces; the active Space renders its Chats as split panes (single / vertical / horizontal / 2×2), focused pane bordered in bright purple.
-- **Live Claude Code sessions:** each Chat spawns `claude` over `--output-format stream-json`; multi-turn continuity via `--session-id` then `--resume`.
-- **Streaming transcript:** assistant messages, a thinking spinner, and Claude-style tool-call / tool-result rendering; slash-command popup; inline markdown; mode indicator; powerline status bar.
-- **Navigation:** `Ctrl-hjkl` focus panes ↔ sidebar, `Tab` / `H` / `L` cycle chats, `Space 1-0` jump to a Space, sidebar add / rename / delete.
-- **Space ops:** merge multiple Spaces (chats combined, ≤4), pop a chat into its own Space, split management.
-- **Persistence:** Spaces (name + chats) saved per tmux session at `~/.local/state/aeovim/<session>.json`; relaunch resumes.
-- **Inter-agent pipe:** a FIFO (`~/.local/state/aeovim/<key>.pipe`) lets one agent message another Space; a reader thread routes it into the target chat's transcript and the agent responds.
-- **Permissions:** dangerous by default (`--dangerously-skip-permissions`); `--safe` switches to `--permission-mode acceptEdits`.
+- **One session per launch:** launches straight into Insert mode, ready to type. State (transcript, session id, title, cost) persists per tmux session; relaunch resumes the same claude conversation via `--resume`, and a session claude no longer knows self-heals into a fresh one.
+- **Long-lived child:** one persistent `claude` process driven over stdin `--input-format stream-json`. Follow-up turns skip the session-reload cost entirely; the child survives across turns and interrupts.
+- **Interrupt:** `Esc` / `Ctrl-C` interrupts the running turn via the control protocol (child stays alive; press again to force-kill). Quitting kills the child — nothing keeps editing files invisibly.
+- **Clean surface:** header (title · model · permissions · session), open transcript with `❯ you` / `✦ claude` blocks, Claude-style `● Tool(...)` / `⎿ result` cards, colored +/- edit hunks, gutter-barred code blocks, lualine-style statusline, bordered composer. Lilac theme throughout.
+- **Streaming that scales:** settled messages are pre-wrapped into a render cache (keyed by revision/width), so a frame only clones the rows in view; token deltas are batched at ~30fps with input always serviced first. Scroll is sticky-bottom — content never yanks the viewport while you're reading; a `↕ %` tag shows when you're detached from the tail.
+- **Tool output kept:** results correlated to their calls by `tool_use_id` (parallel calls render correctly), full text stored (head+tail capped), `za` expands/collapses.
+- **Composer with a real cursor:** arrows/Home/End/Ctrl-a/e/w, grapheme-aware editing, display-width math (CJK/emoji safe), bracketed paste intact, sends queue up while a turn runs.
+- **Persistence:** atomic writes, corrupt-file backup + report (never silent loss), pid lock so two instances can't clobber each other, old multi-space state files backed up before adoption.
+- **Permissions:** dangerous by default (matches the author's `claude` alias); `--safe` switches to `--permission-mode acceptEdits`.
+- **Tests:** 34 total — unit tests for wrapping/markdown/protocol/store plus a PTY + VT-emulation harness that boots the real binary against a scripted fake `claude` (streaming, tool rendering, mid-stream interrupt with session survival, quit-confirm).
 
 ### Designed, not yet built
 
-- Parallel fan-out of one prompt to N agents, each isolated in its own git worktree, as a first-class **job**.
-- A quickfix-style **task board** with done / needs-input / error status.
-- aeovim-owned **loop scheduler** and a **skills palette**.
-- Vim-native **diff review**: `]c` / `[c` hunk motions, visual-select, per-turn git approve/reject on an apply baseline.
+- Multi-agent orchestration (fan-out, task board, loops) — deliberately parked; tmux covers multiplexing for now.
+- Vim-native **diff review**: `]c` / `[c` hunk motions, per-turn git approve/reject.
 - Tree-sitter syntax highlighting (code rendering only).
-- Persistent bidirectional child for in-TUI permission approval, interrupt (`Esc`), and mid-turn steering. (Today's one-child-per-turn model rules these out by design — see INTEGRATION.md.)
+- In-TUI permission approval + mid-turn steering over the control protocol (the session model supports it; the approval UI is the remaining piece).
 
 ## Install & run
 
@@ -51,14 +50,14 @@ The keymap mirrors the author's Neovim config and is still moving. The authorita
 
 | Key | Action |
 |-----|--------|
-| `i` / `Esc` | compose / normal mode |
-| `Enter` | send (in composer) |
-| `Ctrl-h` / `Ctrl-l` | focus sidebar / chat panes |
-| `H` / `L` / `Tab` | previous / next chat |
-| `Space e` | toggle sidebar |
-| `Space 1`–`0` | jump to Space N |
-| `:` | command | 
-| `Space zz` | cheatsheet · `q` quit |
+| type + `Enter` | send (launches in Insert; stays there) |
+| `Shift/Alt-Enter` · `Ctrl-j` | newline |
+| `Esc` / `Ctrl-C` | interrupt the running turn (again = force-kill) |
+| `Esc` (idle) | Normal mode: `j`/`k` scroll · `Ctrl-d/u` · `gg`/`G` |
+| `za` / `zz` | expand tool output / jump to newest |
+| `r` | rename conversation |
+| `/clear` | wipe transcript, fresh session |
+| `?` | cheatsheet · `q` quit (asks) · `:q` quits |
 
 ## Docs
 

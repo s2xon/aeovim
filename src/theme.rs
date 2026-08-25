@@ -19,8 +19,9 @@ pub const PURPLE: Color = Color::Rgb(0xb6, 0x57, 0xff); // PRIMARY accent
 pub const PINK: Color = Color::Rgb(0xf5, 0xb0, 0xef); // secondary accent
 pub const PERI: Color = Color::Rgb(0xa2, 0x9d, 0xfa); // info / added
 pub const MAGENTA: Color = Color::Rgb(0xf2, 0x5a, 0xe6); // numbers / badges
-pub const RED: Color = Color::Rgb(0xf0, 0x3e, 0x5f); // error
+pub const RED: Color = Color::Rgb(0xf0, 0x3e, 0x5f); // error / diff removed
 pub const AMBER: Color = Color::Rgb(0xe0, 0xa4, 0x4e); // warning / running
+pub const GREEN: Color = Color::Rgb(0x7c, 0xd6, 0x9a); // diff added (soft mint)
 
 // Statusline mode colours (mirror lualine make_theme against lilac).
 pub const MODE_NORMAL: Color = PINK;
