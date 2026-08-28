@@ -2,7 +2,7 @@
 
 *vim, but the buffers are live coding agents and the operators drive them.*
 
-**aeovim** is a standalone, keyboard-native Rust TUI for talking to a coding agent. It applies the Neovim mental model — Insert to talk, Normal to read and steer — to one conversation with Claude Code, DeepSeek-TUI style: launch it and you're typing; everything on one clean surface. Multiplexing happens where it already lives — tmux; one `avim` per pane, each with its own persistent session.
+**aeovim** is a standalone, keyboard-native Rust TUI for talking to coding agents — modal, vim-style, codex-simple: a **SPACES sidebar** on the left (a space holds 1–2 chats; two render as a thin-divider vsplit), one clean conversation surface, and vim's grammar over all of it. Launch it and you're typing (Insert); `Esc` is Normal; `:vs` splits; `ga` fuzzy-jumps; `:diff` reviews changes. The chrome stays quiet — cost, model detail, and permissions live behind `:cost` / `:status`, not on screen.
 
 The project is **aeovim**; the command you run is **`avim`** (like Neovim → `nvim`).
 
@@ -10,24 +10,30 @@ It wraps the `claude` CLI (Claude Code) as one long-lived child over headless `s
 
 ## Status
 
-**Usable daily driver (2026-08 rebuild, single-session).** ~4,000 lines of Rust plus a PTY test harness. The 2026-08 pass replaced the one-child-per-turn skeleton with a long-lived session model, fixed the input/rendering/persistence defects that made the skeleton unusable, then collapsed the experimental spaces/panes layer into one clean conversation per launch.
+**Usable daily driver (2026-08 rebuild + multi-session redesign).** ~4,500 lines of Rust plus a PTY test harness. The 2026-08 rebuild replaced the one-child-per-turn skeleton with a long-lived session model and fixed the input/rendering/persistence defects; the redesign pass brought the sessions sidebar back on top of it, with true modal editing and a colour-agnostic token theme.
 
 ### What works today
 
-- **One session per launch:** launches straight into Insert mode, ready to type. State (transcript, session id, title, cost) persists per tmux session; relaunch resumes the same claude conversation via `--resume`, and a session claude no longer knows self-heals into a fresh one.
+- **Spaces, one surface:** the SPACES sidebar lists every space with a live status glyph (`●`/`○` running flash · `✗` error · `✓` idle). `Space ee` toggles it, `Space 1-0` / `gt` / `ga` (fuzzy picker) jump, `Space n` spawns, `d` deletes, `r` renames. Each chat is its own long-lived claude child; everything persists per tmux session and resumes via `--resume` (stale sessions self-heal).
+- **Two chats per space:** `:vs` (or `Ctrl-w v`) adds a second chat pane — a thin-divider vsplit with slim `▎ chat N` headers. `Ctrl-h`/`Ctrl-l` (and `Ctrl-w`) walk sidebar ↔ pane ↔ pane; `:q` closes the focused pane, then the space; the composer always talks to the focused pane.
+- **Diff pad:** `:diff` opens a quick buffer over the focused chat's edit history — newest first, `j`/`k` scrolls the hunk, `Ctrl-j`/`Ctrl-k` steps to older/newer diffs.
+- **Modal, the vim way:** Insert on launch (Enter sends, stays Insert), `Esc` → Normal (scroll, jump, operate), `:` ex commands (`:q` `:vs` `:new` `:clear` `:diff` `:tasks` `:rename` `:cost` `:status` `:N`), `?` help. Mode pill in the statusline: NORMAL / INSERT / COMMAND / RENAME / CONFIRM.
+- **Codex-simple chrome:** header is name + model; statusline is mode + name + a spinner only while the focused turn runs. No cost, ids, or permission flags on screen — `:cost` and `:status` answer those on demand.
+- **Tasks:** `:tasks` / `Space t` — one row per chat (state · elapsed · last line); `⏎` focuses, `x` cancels that chat's turn.
+- **Colour-agnostic theme:** ten base tokens (lilac by default, straight from the author's nvim theme) with every panel/border/selection derived by mixing; override any token in `~/.config/aeovim/theme.toml` and the whole UI rethemes. The terminal background stays transparent.
 - **Long-lived child:** one persistent `claude` process driven over stdin `--input-format stream-json`. Follow-up turns skip the session-reload cost entirely; the child survives across turns and interrupts.
-- **Interrupt:** `Esc` / `Ctrl-C` interrupts the running turn via the control protocol (child stays alive; press again to force-kill). Quitting kills the child — nothing keeps editing files invisibly.
-- **Clean surface:** header (title · model · permissions · session), open transcript with `❯ you` / `✦ claude` blocks, Claude-style `● Tool(...)` / `⎿ result` cards, colored +/- edit hunks, gutter-barred code blocks, lualine-style statusline, bordered composer. Lilac theme throughout.
+- **Interrupt:** `Ctrl-C` (or `Esc` in Normal) interrupts the running turn via the control protocol (child stays alive; press again to force-kill). Quitting kills every child — nothing keeps editing files invisibly.
+- **Clean surface:** open transcript with `▎ you` / `▎ claude` blocks, Claude-style `● Tool(...)` / `⎿ result` cards, colored +/- edit hunks, gutter-barred code blocks, bordered composer.
 - **Streaming that scales:** settled messages are pre-wrapped into a render cache (keyed by revision/width), so a frame only clones the rows in view; token deltas are batched at ~30fps with input always serviced first. Scroll is sticky-bottom — content never yanks the viewport while you're reading; a `↕ %` tag shows when you're detached from the tail.
-- **Tool output kept:** results correlated to their calls by `tool_use_id` (parallel calls render correctly), full text stored (head+tail capped), `za` expands/collapses.
+- **Tool output kept:** results correlated to their calls by `tool_use_id` (parallel calls render correctly), full text stored (head+tail capped), `Ctrl-t` expands/collapses.
 - **Composer with a real cursor:** arrows/Home/End/Ctrl-a/e/w, grapheme-aware editing, display-width math (CJK/emoji safe), bracketed paste intact, sends queue up while a turn runs.
 - **Persistence:** atomic writes, corrupt-file backup + report (never silent loss), pid lock so two instances can't clobber each other, old multi-space state files backed up before adoption.
 - **Permissions:** dangerous by default (matches the author's `claude` alias); `--safe` switches to `--permission-mode acceptEdits`.
-- **Tests:** 34 total — unit tests for wrapping/markdown/protocol/store plus a PTY + VT-emulation harness that boots the real binary against a scripted fake `claude` (streaming, tool rendering, mid-stream interrupt with session survival, quit-confirm).
+- **Tests:** 38 total — unit tests for wrapping/markdown/protocol/store/theme plus a PTY + VT-emulation harness that boots the real binary against a scripted fake `claude` (streaming, tool rendering, mid-stream interrupt with session survival, quit-confirm, and a spaces pass driving the sidebar, `ga` picker, `:vs` split, `:q` pane close, `:diff` pad, and tasks end-to-end).
 
 ### Designed, not yet built
 
-- Multi-agent orchestration (fan-out, task board, loops) — deliberately parked; tmux covers multiplexing for now.
+- Orchestration beyond turn jobs (fan-out groups, loops, subagent rows on the board) — the board today lists real sessions/turns only.
 - Vim-native **diff review**: `]c` / `[c` hunk motions, per-turn git approve/reject.
 - Tree-sitter syntax highlighting (code rendering only).
 - In-TUI permission approval + mid-turn steering over the control protocol (the session model supports it; the approval UI is the remaining piece).
@@ -46,18 +52,24 @@ Sessions persist per tmux session; relaunch `avim` to resume where you left off.
 
 ## Keys
 
-The keymap mirrors the author's Neovim config and is still moving. The authoritative, in-app reference is **`Space zz`** (cheatsheet); `avim --help` prints the current summary. The stable essentials:
+Modal — Insert on launch, `Esc` is Normal. The authoritative, in-app reference is **`?`** / **`F1`** / **`/help`**; `avim --help` prints the current summary. The stable essentials:
 
 | Key | Action |
 |-----|--------|
 | type + `Enter` | send (launches in Insert; stays there) |
 | `Shift/Alt-Enter` · `Ctrl-j` | newline |
-| `Esc` / `Ctrl-C` | interrupt the running turn (again = force-kill) |
-| `Esc` (idle) | Normal mode: `j`/`k` scroll · `Ctrl-d/u` · `gg`/`G` |
-| `za` / `zz` | expand tool output / jump to newest |
-| `r` | rename conversation |
-| `/clear` | wipe transcript, fresh session |
-| `?` | cheatsheet · `q` quit (asks) · `:q` quits |
+| `Esc` | Insert → Normal (draft kept) · in Normal: snap to the tail |
+| `i` `a` `o` | Normal → Insert |
+| `Ctrl-C` | interrupt the running turn (again = force-kill) · idle: quit (asks) |
+| `Space ee` · `Ctrl-h`/`Ctrl-l` | toggle sidebar · walk sidebar ↔ panes |
+| `Space 1-0` · `gt`/`gT` · `ga` | jump to space N · cycle · fuzzy picker |
+| `Space n` · `Space t` | new space · tasks |
+| `:vs` · `Ctrl-w v/h/l/w/q` | split into two chats · vim window commands |
+| `:diff` | diff pad — `j/k` scroll · `Ctrl-j/k` older/newer |
+| `:` | `:q` (pane→space) `:qa` `:new` `:clear` `:rename` `:tasks` `:cost` `:status` `:N` |
+| `j`/`k` · `Ctrl-d`/`u` · `gg`/`G` | scroll (Normal) |
+| `Ctrl-t` | expand / collapse tool output |
+| `/clear` · `/rename` · `/mouse` · `/tools` · `/new` · `/tasks` | local slash commands |
 
 ## Docs
 

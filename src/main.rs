@@ -78,16 +78,9 @@ async fn main() -> Result<()> {
     // Claim the workspace key with a pid lock: two avims in one tmux session
     // used to share a state file and silently clobber each other on save.
     let key = store::claim_key(&store::workspace_key());
-    let (restored, mut load_warning) = store::load(&key);
-    // Single-session model adopts the FIRST saved chat. If the state file came
-    // from the old multi-space build, preserve the original before our saves
-    // overwrite it — nothing is silently lost.
-    let total_chats: usize = restored.iter().map(|s| s.chats.len()).sum();
-    if total_chats > 1 {
-        if let Some(note) = store::backup_multi(&key) {
-            load_warning.get_or_insert(note);
-        }
-    }
+    // Every saved chat is adopted into the sessions sidebar (old multi-space
+    // files flatten into it too — nothing is lost).
+    let (restored, load_warning) = store::load(&key);
 
     install_panic_hook();
     enable_raw_mode()?;
@@ -193,7 +186,7 @@ async fn run(
             break;
         }
         let stream_due = app.dirty && last_draw.elapsed() >= STREAM_FRAME;
-        let tick_due = had_tick && (app.chat.in_flight || app.dirty);
+        let tick_due = had_tick && (app.any_in_flight() || app.dirty);
         if had_input || stream_due || tick_due {
             terminal.draw(|f| ui::render(f, app))?;
             app.dirty = false;
@@ -227,15 +220,20 @@ fn print_help() {
     println!("PERMISSIONS: dangerous by default (--dangerously-skip-permissions).");
     println!("             pass --safe to use --permission-mode acceptEdits.\n");
     println!("MOUSE: off by default so you can select/copy transcript text with the");
-    println!("       cursor (tmux/Ghostty selection). --mouse (or :mouse) turns on");
+    println!("       cursor (tmux/Ghostty selection). --mouse (or /mouse) turns on");
     println!("       wheel-scroll, at the cost of drag-select needing Shift/Option.\n");
-    println!("ONE SESSION PER LAUNCH — launches ready to type (Insert mode).");
+    println!("SPACES + MODAL — a space holds 1-2 chats; sidebar left, Insert on launch.");
     println!("KEYS:");
-    println!("  type + Enter     send (stays in Insert)   Shift/Alt-Enter / Ctrl-j  newline");
-    println!("  Esc / Ctrl-c     interrupt running turn   (press again to force-kill)");
-    println!("  Esc (idle)       Normal mode: j/k scroll · Ctrl-d/u half page · gg/G ends");
-    println!("  za               expand/collapse tool output    zz  jump to newest");
-    println!("  r                rename conversation      /clear  fresh session");
-    println!("  ?                keys cheatsheet          : command   q quit (asks)");
-    println!("  session persists per tmux session — relaunch avim to resume it");
+    println!("  type + Enter     send (stays Insert)      Shift/Alt-Enter / Ctrl-j  newline");
+    println!("  Esc              Insert -> Normal · Normal: snap to the live tail");
+    println!("  Ctrl-c           interrupt running turn (again = force) · idle: quit (asks)");
+    println!("  Space ee         toggle spaces sidebar     Space 1-0 / ga / gt  jump space");
+    println!("  Space n          new space                 Space t / :tasks     tasks");
+    println!("  :vs / Ctrl-w v   split: second chat        Ctrl-h/l / Ctrl-w    move panes");
+    println!("  :q               close pane, then space    :qa quit · :q! now");
+    println!("  :diff            diff pad (j/k scroll, Ctrl-j older, Ctrl-k newer)");
+    println!("  :cost / :status  spend + session info (kept off the chrome)");
+    println!("  Ctrl-t           expand/collapse tool output     ? / F1  keys cheatsheet");
+    println!("  THEME: colour-agnostic — override tokens in ~/.config/aeovim/theme.toml");
+    println!("  spaces persist per tmux session — relaunch avim to resume them");
 }

@@ -81,6 +81,29 @@ while True:
           "message": {"content": [{"type": "tool_result", "tool_use_id": "t1",
                                     "content": "hi"}]}})
     emit({"type": "assistant",
+          "message": {"content": [{"type": "tool_use", "id": "t2", "name": "Edit",
+                                    "input": {"file_path": "demo.rs",
+                                              "old_string": "a",
+                                              "new_string": "b\nc"}}]}})
+    emit({"type": "user",
+          "message": {"content": [{"type": "tool_result", "tool_use_id": "t2",
+                                    "content": "ok"}]}})
+    # A SECOND file, so the diff pad has a real file boundary to scroll
+    # across. Gated on the prompt: emitting it for every turn lengthens the
+    # transcript and scrolls the other tests' expectations off a 30-row screen.
+    if "twofiles" in line:
+        # Long enough that the two files together overflow the pad, which is
+        # what makes the scroll-across-a-boundary behaviour testable at all.
+        big = "\n".join("y%02d" % i for i in range(30))
+        emit({"type": "assistant",
+              "message": {"content": [{"type": "tool_use", "id": "t3", "name": "Edit",
+                                        "input": {"file_path": "util.rs",
+                                                  "old_string": "x",
+                                                  "new_string": big}}]}})
+        emit({"type": "user",
+              "message": {"content": [{"type": "tool_result", "tool_use_id": "t3",
+                                        "content": "ok"}]}})
+    emit({"type": "assistant",
           "message": {"content": [{"type": "text", "text": "Tool run finished."}]}})
     result_ok("Hello from fake.")
 "#;
@@ -232,9 +255,10 @@ impl Harness {
 fn boots_composes_streams_and_quits_with_confirm() {
     let mut h = Harness::spawn();
 
-    // Boot: header + welcome, already in Insert — just type.
+    // Boot: header + sessions sidebar + welcome, already in Insert — just type.
     h.assert_on_screen("aeovim", 10);
-    h.assert_on_screen("one conversation", 10);
+    h.assert_on_screen("SPACES", 10);
+    h.assert_on_screen("claude code underneath", 10);
     h.assert_on_screen("INSERT", 5);
     h.keys("hello fake agent");
     h.assert_on_screen("hello fake agent", 5);
@@ -249,18 +273,17 @@ fn boots_composes_streams_and_quits_with_confirm() {
     // Send must STAY in Insert mode (the old drop-to-Normal made `q` lethal).
     assert!(
         h.screen_text().contains("INSERT"),
-        "mode must remain INSERT after send:\n{}",
+        "composer must stay live after send:\n{}",
         h.screen_text()
     );
 
     // The user prompt echoed into the transcript, and the conversation was
     // auto-named from it (header shows the slug).
-    h.assert_on_screen("❯ you", 5);
+    h.assert_on_screen("▎ you", 5);
 
-    // Esc → Normal, q → confirm overlay (NOT instant quit), y → exit.
-    h.keys("\x1b");
-    h.assert_on_screen("NORMAL", 5);
-    h.keys("q");
+    // Ctrl-C on an idle, empty composer → confirm overlay (NOT instant quit),
+    // y → exit.
+    h.keys("\x03");
     h.assert_on_screen("quit aeovim?", 5);
     h.keys("y");
 
@@ -280,7 +303,7 @@ fn boots_composes_streams_and_quits_with_confirm() {
 #[test]
 fn interrupt_stops_the_turn_and_the_session_survives() {
     let mut h = Harness::spawn();
-    h.assert_on_screen("one conversation", 10);
+    h.assert_on_screen("claude code underneath", 10);
     h.assert_on_screen("INSERT", 5);
 
     // Start the long streaming turn and interrupt it mid-stream (Ctrl-C with an
@@ -293,11 +316,12 @@ fn interrupt_stops_the_turn_and_the_session_survives() {
     // The same child must serve the next turn — long-lived session model.
     h.keys("still alive?\r");
     h.assert_on_screen("Hello from fake.", 10);
+    // Wait for the WHOLE turn (tools included) — a Ctrl-C mid-turn would
+    // interrupt instead of asking to quit.
+    h.assert_on_screen("Tool run finished.", 10);
 
-    // Cleanup: Esc alone, then confirm-quit.
-    h.keys("\x1b");
-    h.assert_on_screen("NORMAL", 5);
-    h.keys("q");
+    // Cleanup: Ctrl-C (idle, empty composer) asks to quit; y confirms.
+    h.keys("\x03");
     h.assert_on_screen("quit aeovim?", 5);
     h.keys("y");
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -313,7 +337,7 @@ fn interrupt_stops_the_turn_and_the_session_survives() {
 #[test]
 fn markdown_underscores_survive_and_slash_popup_is_safe_when_short() {
     let mut h = Harness::spawn();
-    h.assert_on_screen("one conversation", 10);
+    h.assert_on_screen("claude code underneath", 10);
     // snake_case in the composer must render literally (the old markdown pass
     // ate the underscores out of the composer echo too, via the same renderer).
     h.keys("check foo_bar_baz now");
@@ -324,12 +348,12 @@ fn markdown_underscores_survive_and_slash_popup_is_safe_when_short() {
     h.keys("/cl");
     h.assert_on_screen("commands", 5);
     h.assert_on_screen("/clear", 5);
-    // Esc must stand alone — sent together with the next key the terminal
-    // would read ESC+q as Alt-q.
+    // Esc drops to Normal (vim-style; draft kept) — the popup closes.
     h.keys("\x1b");
+    let _ = h.wait_gone("/clear", 2);
     h.assert_on_screen("NORMAL", 5);
-    // quit
-    h.keys("q");
+    // Ctrl-C in idle Normal asks to quit; y confirms.
+    h.keys("\x03");
     h.assert_on_screen("quit aeovim?", 5);
     h.keys("y");
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -341,4 +365,161 @@ fn markdown_underscores_survive_and_slash_popup_is_safe_when_short() {
         std::thread::sleep(Duration::from_millis(50));
     }
     let _ = h.wait_gone("quit", 1);
+}
+
+#[test]
+fn sidebar_picker_and_board_drive_multiple_sessions() {
+    let mut h = Harness::spawn();
+    h.assert_on_screen("SPACES", 10);
+    h.assert_on_screen("INSERT", 5);
+
+    // Session 1: send a turn (auto-names the session off the prompt).
+    h.keys("hello fake agent\r");
+    h.assert_on_screen("Hello from fake.", 10);
+
+    // Esc drops to Normal; Space n opens a fresh second session in Insert.
+    h.keys("\x1b");
+    h.assert_on_screen("NORMAL", 5);
+    h.keys(" n");
+    h.assert_on_screen("2 spaces", 5);
+    h.assert_on_screen("claude code underneath", 5); // fresh welcome
+    h.keys("tell me about ramen\r");
+    h.assert_on_screen("Tool run finished.", 10);
+
+    // ga fuzzy picker: "hello" matches only session 1; Enter focuses it.
+    // (wait for NORMAL — a bare ESC byte followed instantly by 'g' would be
+    // parsed as Alt-g by crossterm)
+    h.keys("\x1b");
+    h.assert_on_screen("NORMAL", 5);
+    h.keys("ga");
+    h.assert_on_screen("GO TO SPACE", 5);
+    h.keys("hello");
+    h.keys("\r");
+    let _ = h.wait_gone("GO TO SPACE", 2);
+    h.assert_on_screen("hello fake agent", 5);
+
+    // Space t opens the task board (one row per session); Esc closes it.
+    h.keys(" t");
+    h.assert_on_screen("TASKS —", 5);
+    h.keys("\x1b");
+    assert!(
+        h.wait_gone("TASKS —", 3),
+        "board must close on Esc:\n{}",
+        h.screen_text()
+    );
+
+    // `:2` jumps back to the second space.
+    h.keys(":2\r");
+    h.assert_on_screen("tell me about ramen", 5);
+
+    // `:vs` splits the space into two chat panes (Insert in the new pane).
+    h.keys(":vs\r");
+    h.assert_on_screen("chat 2", 5);
+    h.assert_on_screen("(2)", 5); // sidebar shows the pane count
+    h.keys("\x1b");
+    h.assert_on_screen("NORMAL", 5);
+    // `:q` closes the focused pane immediately, leaving one chat. No prompt:
+    // typing the command is the confirmation (Saxon, 2026-08-27).
+    h.keys(":q\r");
+    assert!(
+        h.wait_gone("chat 2", 3),
+        "pane must close on :q without asking\n{}",
+        h.screen_text()
+    );
+
+    // `:diff` opens the diff pad over this chat's edit history.
+    h.keys(":diff\r");
+    h.assert_on_screen("DIFF", 5);
+    h.assert_on_screen("demo.rs", 5);
+    h.keys("\x1b");
+    assert!(
+        h.wait_gone("DIFF", 3),
+        "diff pad must close on Esc\n{}",
+        h.screen_text()
+    );
+
+    // Quit: Ctrl-c asks, y confirms; both children must die with us.
+    h.keys("\x03");
+    h.assert_on_screen("quit aeovim?", 5);
+    h.keys("y");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while h.child.try_wait().map(|o| o.is_none()).unwrap_or(false) {
+        if Instant::now() > deadline {
+            let _ = h.child.kill();
+            panic!("avim did not exit");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The three things Saxon asked for on 2026-08-27: `:q` without a prompt,
+/// a per-space directory reachable by fuzzy picker, and a diff pad that holds
+/// every file changed in the session and renames its header as you scroll
+/// from one file's hunk into the next.
+#[test]
+fn dir_picker_and_multi_file_diff_pad() {
+    let mut h = Harness::spawn();
+    h.assert_on_screen("INSERT", 5);
+    h.keys("edit twofiles please\r");
+    h.assert_on_screen("Tool run finished.", 10);
+    h.keys("\x1b");
+    h.assert_on_screen("NORMAL", 5);
+
+    // `gd` opens the directory picker rooted at $HOME; Esc closes it.
+    h.keys("gd");
+    h.assert_on_screen("OPEN DIR", 5);
+    h.keys("\x1b");
+    assert!(
+        h.wait_gone("OPEN DIR", 3),
+        "dir picker must close on Esc\n{}",
+        h.screen_text()
+    );
+
+    // `:pwd` reports the space's own directory. (Not asserting a `~` form:
+    // the harness points HOME at a temp dir whose cwd canonicalizes to
+    // /private/var/…, so the abbreviation correctly doesn't apply here.)
+    // (The statusline elides a long path, so match its visible head.)
+    h.keys(":pwd\r");
+    h.assert_on_screen("/private/var/folders", 5);
+
+    // `:cd` refuses a path that isn't a directory rather than inventing one.
+    h.keys(":cd /nope/not/here\r");
+    h.assert_on_screen("not a directory", 5);
+
+    // The diff pad opens on the NEWEST file and knows it is one of two.
+    h.keys(":diff\r");
+    h.assert_on_screen("DIFF", 5);
+    h.assert_on_screen("util.rs", 5);
+    h.assert_on_screen("file 2/2", 5);
+
+    // Ctrl-k jumps back a whole file — the header renames to the older one.
+    h.keys("\x0b");
+    h.assert_on_screen("demo.rs", 5);
+    h.assert_on_screen("file 1/2", 5);
+
+    // Scrolling down far enough crosses the boundary into util.rs, and the
+    // header follows the row at the top of the viewport.
+    for _ in 0..14 {
+        h.keys("j");
+    }
+    h.assert_on_screen("util.rs", 5);
+    h.assert_on_screen("file 2/2", 5);
+
+    h.keys("\x1b");
+    assert!(
+        h.wait_gone("DIFF", 3),
+        "diff pad must close on Esc\n{}",
+        h.screen_text()
+    );
+
+    // `:q` on the last pane of the last space quits outright — no prompt.
+    h.keys(":q\r");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while h.child.try_wait().map(|o| o.is_none()).unwrap_or(false) {
+        if Instant::now() > deadline {
+            let _ = h.child.kill();
+            panic!("`:q` must quit without asking:\n{}", h.screen_text());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }

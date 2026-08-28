@@ -1,9 +1,14 @@
-//! App state + update logic — single-session model.
+//! App state + update logic — spaces, codex-simple chrome, vim modal.
 //!
-//! One launch = one conversation with one long-lived claude child, DeepSeek-TUI
-//! style. Multiplexing lives outside (tmux panes each run their own `avim`,
-//! keyed per tmux session). The app starts in Insert mode, ready to type.
+//! A SPACE is the sidebar unit: a named container of 1–2 chats (two render as
+//! a thin-divider vsplit; `:vs` splits, Ctrl-w moves, `:q` closes). Each chat
+//! is its own long-lived claude child. Modal: Insert composes (the launch
+//! state), Esc drops to Normal, `:` runs ex commands, `ga` fuzzy-jumps spaces,
+//! `:tasks` opens the board, `:diff` opens the diff pad (Ctrl-j/k walks
+//! history). Chrome stays minimal, codex-style — cost/model/permissions live
+//! behind `:cost` / `:status`, not on screen. Persistence per tmux session.
 
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crossterm::event::{
@@ -21,19 +26,61 @@ use crate::store::{self, PersistChat, PersistSpace};
 
 #[derive(PartialEq, Clone, Copy)]
 pub enum Mode {
+    /// Navigate: scroll, jump sessions, drive the sidebar. No text reaches the
+    /// composer or the agent.
     Normal,
+    /// Compose (the launch state): the composer is live; Enter sends.
     Insert,
-    Command,
     Rename,
+    /// `:` ex commands (:q, :new, :tasks, …).
+    Command,
     Confirm,
 }
 
 #[derive(PartialEq, Clone, Copy)]
-pub enum Pending {
+pub enum Focus {
+    Sidebar,
+    Main,
+}
+
+/// Full-screen overlays, drawn over the main surface and closed with Esc.
+#[derive(PartialEq, Clone, Copy)]
+pub enum Overlay {
+    None,
+    Help,
+    /// `ga` — fuzzy space picker.
+    Picker,
+    /// `gd` / bare `:cd` — fuzzy directory picker rooted at $HOME.
+    DirPicker,
+    /// `:tasks` / Space t — one row per chat's current work.
+    Board,
+    /// `:diff` — quick pad over the focused chat's edit history.
+    DiffPad,
+}
+
+/// Multi-key sequences in Normal mode (g-prefix, Space leader, Ctrl-w).
+#[derive(PartialEq, Clone, Copy)]
+enum Pending {
     None,
     G,
-    Z,
     Leader,
+    LeaderE,
+    CtrlW,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum ConfirmWhat {
+    Quit,
+    DeleteSpace(usize),
+}
+
+/// Sidebar/board status, derived from live state — never stored.
+#[derive(PartialEq, Clone, Copy)]
+pub enum ChatStatus {
+    Running,
+    Error,
+    Idle,
+    New,
 }
 
 #[derive(Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -48,6 +95,19 @@ pub enum DiffKind {
 pub struct DiffLine {
     pub kind: DiffKind,
     pub text: String,
+}
+
+/// How many files the diff pad holds, newest last. Each is already capped to
+/// ~151 lines by `cap_diff`, so this bounds the pad at roughly 6k rows.
+const PAD_MAX_FILES: usize = 40;
+
+/// One row of the diff pad's continuous document. `line: None` marks the
+/// separator that introduces a file.
+pub struct DocRow {
+    pub file: String,
+    pub added: usize,
+    pub removed: usize,
+    pub line: Option<DiffLine>,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -68,8 +128,59 @@ pub enum Entry {
     Error(String),
 }
 
+/// The sidebar unit: a named container of one or two chats. Two chats render
+/// as a thin-divider vsplit; `focused` is the pane the composer talks to.
+pub struct Space {
+    pub name: String,
+    pub chats: Vec<Chat>,
+    pub focused: usize,
+    /// Working directory for every chat in this space — the cwd each claude
+    /// child is spawned in (Saxon, 2026-08-27: "in a space i should be able
+    /// to open into a dir"). Set with `:cd`, or `gd` for the fuzzy picker.
+    /// Per-space, so two spaces can sit in two different repos at once.
+    pub dir: PathBuf,
+}
+
+impl Space {
+    fn of(chat: Chat) -> Self {
+        Space {
+            name: String::new(),
+            chats: vec![chat],
+            focused: 0,
+            dir: default_dir(),
+        }
+    }
+
+    pub fn focused_chat(&self) -> &Chat {
+        &self.chats[self.focused.min(self.chats.len() - 1)]
+    }
+
+    /// Aggregate status for the sidebar glyph: running beats error beats idle.
+    pub fn status(&self) -> ChatStatus {
+        if self.chats.iter().any(|c| c.in_flight) {
+            ChatStatus::Running
+        } else if self.chats.iter().any(|c| c.status() == ChatStatus::Error) {
+            ChatStatus::Error
+        } else if self.chats.iter().all(|c| c.transcript.is_empty()) {
+            ChatStatus::New
+        } else {
+            ChatStatus::Idle
+        }
+    }
+}
+
+/// Display name for a space ("new space" until named).
+pub fn space_name(sp: &Space) -> String {
+    if sp.name.trim().is_empty() {
+        "new space".to_string()
+    } else {
+        sp.name.clone()
+    }
+}
+
 pub struct Chat {
-    pub title: String,
+    /// Stable id on the Msg wire — agent events route back to THIS chat.
+    pub id: u64,
     pub transcript: Vec<Entry>,
     /// Bumped on every transcript mutation — the render cache's invalidation key.
     pub rev: u64,
@@ -96,7 +207,7 @@ pub struct Chat {
     pub session: Option<crate::agent::SessionHandle>,
     /// An interrupt was requested for the in-flight turn (Esc again = hard kill).
     pub interrupting: bool,
-    /// za — render tool results in full instead of one summary line.
+    /// Ctrl-t — render tool results in full instead of one summary line.
     pub expand_tools: bool,
     /// In-flight tool calls: (tool_use_id, transcript index of the ● Tool entry),
     /// so each result lands under ITS call even when calls run in parallel.
@@ -107,16 +218,16 @@ pub struct Chat {
 }
 
 impl Chat {
-    fn fresh() -> Self {
+    fn fresh(id: u64) -> Self {
         let session_id = Uuid::new_v4().to_string();
-        Chat::blank(session_id, String::new(), true, 0.0)
+        Chat::blank(id, session_id, true, 0.0)
     }
 
-    fn from_persist(pc: &PersistChat) -> Self {
+    fn from_persist(id: u64, pc: &PersistChat) -> Self {
         // `started` decides --session-id vs --resume on the next spawn: a chat
         // that never actually sent a turn must NOT try to resume a session that
         // claude has no record of.
-        let mut c = Chat::blank(pc.session_id.clone(), pc.title.clone(), !pc.started, pc.cost);
+        let mut c = Chat::blank(id, pc.session_id.clone(), !pc.started, pc.cost);
         if !pc.transcript.is_empty() {
             c.transcript = pc.transcript.clone();
             c.rev += 1;
@@ -124,9 +235,9 @@ impl Chat {
         c
     }
 
-    fn blank(session_id: String, title: String, first_turn: bool, cost: f64) -> Self {
+    fn blank(id: u64, session_id: String, first_turn: bool, cost: f64) -> Self {
         Chat {
-            title,
+            id,
             transcript: Vec::new(),
             rev: 0,
             streaming: None,
@@ -147,6 +258,19 @@ impl Chat {
             expand_tools: false,
             pending_tools: Vec::new(),
             cache: crate::ui::RenderCache::default(),
+        }
+    }
+
+    /// Live status for the sidebar glyph and the board row.
+    pub fn status(&self) -> ChatStatus {
+        if self.in_flight {
+            ChatStatus::Running
+        } else if matches!(self.transcript.last(), Some(Entry::Error(_))) {
+            ChatStatus::Error
+        } else if self.transcript.is_empty() {
+            ChatStatus::New
+        } else {
+            ChatStatus::Idle
         }
     }
 
@@ -246,19 +370,11 @@ fn cap_tool_text(text: &str) -> String {
     }
 }
 
-pub fn chat_title(c: &Chat) -> String {
-    if c.title.trim().is_empty() {
-        "new conversation".to_string()
-    } else {
-        c.title.clone()
-    }
-}
-
 /// True when `name` is still an auto-generated default or empty — used so the
 /// first rename starts from an empty buffer, and auto-naming can take over.
 fn is_default_name(name: &str) -> bool {
     let name = name.trim();
-    name.is_empty() || name == "new conversation"
+    name.is_empty() || name == "new space"
 }
 
 fn slug(s: &str) -> String {
@@ -295,6 +411,88 @@ pub fn next_grapheme(s: &str, at: usize) -> usize {
         }
     }
     s.len()
+}
+
+/// Where a new space starts: the directory aeovim itself was launched in.
+fn default_dir() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| home_dir())
+}
+
+pub fn home_dir() -> PathBuf {
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/"))
+}
+
+/// `~/src/foo` rather than `/Users/saxon/src/foo` — the form worth showing.
+pub fn tilde(p: &Path) -> String {
+    match p.strip_prefix(home_dir()) {
+        Ok(rel) if rel.as_os_str().is_empty() => "~".to_string(),
+        Ok(rel) => format!("~/{}", rel.display()),
+        Err(_) => p.display().to_string(),
+    }
+}
+
+/// Expand a leading `~`, and resolve relative paths against the space's
+/// current dir so `:cd ../sibling` behaves the way a shell would. Returns
+/// None unless the result is a real directory — `:cd` never invents a path.
+fn resolve_dir(input: &str, base: &Path) -> Option<PathBuf> {
+    let s = input.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let p = if s == "~" {
+        home_dir()
+    } else if let Some(rest) = s.strip_prefix("~/") {
+        home_dir().join(rest)
+    } else {
+        let p = PathBuf::from(s);
+        if p.is_absolute() { p } else { base.join(p) }
+    };
+    std::fs::canonicalize(&p).ok().filter(|p| p.is_dir())
+}
+
+/// Directories under $HOME, for the `gd` picker. Bounded on purpose: walking
+/// a whole home directory is unbounded work and mostly noise. Depth 3 with
+/// the heavy and hidden trees skipped covers where projects actually live,
+/// and keeps the scan fast enough to run on open.
+fn scan_dirs() -> Vec<PathBuf> {
+    const SKIP: &[&str] = &[
+        "node_modules",
+        "target",
+        "Library",
+        "Applications",
+        "Pictures",
+        "Movies",
+        "Music",
+        "Public",
+    ];
+    const CAP: usize = 4000;
+
+    let home = home_dir();
+    let mut out = vec![home.clone()];
+    let mut queue = vec![(home, 0usize)];
+    while let Some((dir, depth)) = queue.pop() {
+        if depth >= 3 || out.len() >= CAP {
+            continue;
+        }
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for e in rd.flatten() {
+            if !e.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') || SKIP.contains(&name.as_str()) {
+                continue;
+            }
+            let p = e.path();
+            out.push(p.clone());
+            queue.push((p, depth + 1));
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 fn short_path(p: &str) -> String {
@@ -610,32 +808,49 @@ fn format_todos(input: &Value) -> String {
 pub enum Msg {
     Input(Event),
     Tick,
-    // `chat` ids stay on the wire so agent.rs needs no rewiring when
-    // multi-session returns; the single-session app ignores them.
-    #[allow(dead_code)]
+    /// An event from one session's claude child, routed by chat id.
     Agent { chat: u64, ev: AgentEvent },
     /// The claude child exited (crash, error, or deliberate kill).
-    #[allow(dead_code)]
     SessionEnded { chat: u64, error: Option<String> },
     /// Clipboard contents read off the UI task (Ctrl-v fallback).
     Pasted(String),
 }
 
-/// The single chat's id on the Msg wire (kept so agent.rs stays id-based and a
-/// multi-session future doesn't rewire the protocol).
-const CHAT_ID: u64 = 1;
-
 pub struct App {
     pub mode: Mode,
-    pub pending: Pending,
     pub input: String,
     /// Cursor position in `input`: a byte offset on a grapheme boundary.
     pub input_cursor: usize,
-    pub cmd: String,
     pub rename_buf: String,
-    pub chat: Chat,
-    /// The confirm overlay is asking about quitting.
-    pending_quit: bool,
+    /// Which space `rename_buf` is renaming (a sidebar rename can target a
+    /// non-active row).
+    pub rename_target: usize,
+    pub spaces: Vec<Space>,
+    pub active: usize,
+    next_id: u64,
+    pub focus: Focus,
+    pub sidebar_open: bool,
+    pub sidebar_cursor: usize,
+    pub overlay: Overlay,
+    pending: Pending,
+    pub cmdline: String,
+    pub picker_query: String,
+    pub picker_sel: usize,
+    pub dir_query: String,
+    pub dir_sel: usize,
+    /// Previous dir of the active space, for `:cd -`.
+    prev_dir: Option<PathBuf>,
+    /// Scanned once per picker open, not per keystroke.
+    pub dir_candidates: Vec<PathBuf>,
+    pub board_sel: usize,
+    /// Diff pad position: which diff (0 = newest) and the scroll within it.
+    pub diff_scroll: usize,
+    /// Cached pad document; see `sync_diff_doc`. Cleared when the pad closes.
+    pub diff_rows: Vec<DocRow>,
+    pub diff_starts: Vec<usize>,
+    pub diff_elided: usize,
+    diff_key: Option<(u64, u64)>,
+    confirm_what: ConfirmWhat,
     pub confirm_msg: String,
     /// Something on screen changed since the last draw (main loop's redraw gate).
     pub dirty: bool,
@@ -646,9 +861,8 @@ pub struct App {
     pub dangerous: bool,
     pub should_quit: bool,
     pub spinner: usize,
-    pub help_open: bool,
     /// Mouse capture state. Default OFF so the cursor can select/copy text (and
-    /// tmux/Ghostty native selection works); `:mouse` toggles wheel-scroll on.
+    /// tmux/Ghostty native selection works); `/mouse` toggles wheel-scroll on.
     pub mouse_capture: bool,
     pub slash_commands: Vec<String>,
     pub slash_sel: usize,
@@ -665,23 +879,92 @@ impl App {
         restored: Vec<PersistSpace>,
     ) -> Self {
         let model_display = model_cli.clone().unwrap_or_else(|| "default".into());
-        // Single-session model: adopt the first saved chat; anything beyond it
-        // was already backed up by main() before we overwrite on save.
-        let chat = restored
-            .first()
-            .and_then(|sp| sp.chats.first())
-            .map(Chat::from_persist)
-            .unwrap_or_else(Chat::fresh);
+        // Adopt every saved space. Legacy shapes migrate: an unnamed space with
+        // many chats (the flat multi-session save) splits into one space per
+        // chat, named by the chat's old title; an oversize space (>2 chats)
+        // spills its extras into their own spaces. Nothing is dropped.
+        let mut next_id: u64 = 1;
+        let mut spaces: Vec<Space> = Vec::new();
+        for sp in &restored {
+            let named = !sp.name.trim().is_empty();
+            if named && sp.chats.len() <= 2 && !sp.chats.is_empty() {
+                let mut chats = Vec::new();
+                for pc in &sp.chats {
+                    chats.push(Chat::from_persist(next_id, pc));
+                    next_id += 1;
+                }
+                spaces.push(Space {
+                    name: sp.name.clone(),
+                    chats,
+                    focused: 0,
+                    // A saved dir that has since been moved or deleted falls
+                    // back rather than spawning sessions into nowhere.
+                    dir: sp
+                        .dir
+                        .as_deref()
+                        .map(PathBuf::from)
+                        .filter(|p| p.is_dir())
+                        .unwrap_or_else(default_dir),
+                });
+            } else {
+                for pc in &sp.chats {
+                    let c = Chat::from_persist(next_id, pc);
+                    next_id += 1;
+                    let mut s = Space::of(c);
+                    s.name = pc.title.clone();
+                    spaces.push(s);
+                }
+            }
+        }
+        if spaces.is_empty() {
+            spaces.push(Space::of(Chat::fresh(next_id)));
+            next_id += 1;
+        }
+
+        // The launch directory decides which space you land in (Saxon,
+        // 2026-08-27): if a saved space is already pointed at this directory,
+        // reopen THAT one; otherwise this directory gets a space of its own.
+        // So `cd ~/foo && avim` resumes the space you last worked in there —
+        // including one you created in ~ and later `:cd`'d into ~/foo —
+        // rather than whatever happened to be active when you quit.
+        let here = default_dir();
+        let active = match spaces.iter().position(|s| s.dir == here) {
+            Some(i) => i,
+            None => {
+                spaces.push(Space::of(Chat::fresh(next_id)));
+                next_id += 1;
+                spaces.len() - 1
+            }
+        };
 
         Self {
             mode: Mode::Insert, // launch ready to type
-            pending: Pending::None,
             input: String::new(),
             input_cursor: 0,
-            cmd: String::new(),
             rename_buf: String::new(),
-            chat,
-            pending_quit: false,
+            rename_target: 0,
+            spaces,
+            active,
+            next_id,
+            focus: Focus::Main,
+            sidebar_open: true,
+            sidebar_cursor: active,
+            overlay: Overlay::None,
+            pending: Pending::None,
+            cmdline: String::new(),
+            picker_query: String::new(),
+            picker_sel: 0,
+            dir_query: String::new(),
+            dir_sel: 0,
+            prev_dir: None,
+            dir_candidates: Vec::new(),
+            board_sel: 0,
+            diff_scroll: 0,
+            diff_rows: Vec::new(),
+            diff_starts: Vec::new(),
+            diff_elided: 0,
+            diff_key: None,
+            confirm_what: ConfirmWhat::Quit,
             confirm_msg: String::new(),
             dirty: true,
             toast: None,
@@ -690,13 +973,147 @@ impl App {
             dangerous,
             should_quit: false,
             spinner: 0,
-            help_open: false,
             mouse_capture: false,
             slash_commands: Vec::new(),
             slash_sel: 0,
             workspace_key,
             tx,
         }
+    }
+
+    /// The active space.
+    pub fn space(&self) -> &Space {
+        &self.spaces[self.active]
+    }
+
+    fn space_mut(&mut self) -> &mut Space {
+        let i = self.active;
+        &mut self.spaces[i]
+    }
+
+    /// The focused chat of the active space — what the composer talks to.
+    pub fn chat(&self) -> &Chat {
+        self.spaces[self.active].focused_chat()
+    }
+
+    fn chat_mut(&mut self) -> &mut Chat {
+        let i = self.active;
+        let sp = &mut self.spaces[i];
+        let f = sp.focused.min(sp.chats.len() - 1);
+        &mut sp.chats[f]
+    }
+
+    /// Locate a chat by wire id → (space index, chat index).
+    fn find_chat(&self, id: u64) -> Option<(usize, usize)> {
+        for (si, sp) in self.spaces.iter().enumerate() {
+            for (ci, c) in sp.chats.iter().enumerate() {
+                if c.id == id {
+                    return Some((si, ci));
+                }
+            }
+        }
+        None
+    }
+
+    /// Every chat as a flat (space, chat) list — the board's row order.
+    pub fn board_rows(&self) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        for (si, sp) in self.spaces.iter().enumerate() {
+            for ci in 0..sp.chats.len() {
+                out.push((si, ci));
+            }
+        }
+        out
+    }
+
+    pub fn any_in_flight(&self) -> bool {
+        self.spaces.iter().any(|s| s.chats.iter().any(|c| c.in_flight))
+    }
+
+    /// Spaces with work running (the sidebar rollup).
+    pub fn running_count(&self) -> usize {
+        self.spaces
+            .iter()
+            .filter(|s| s.chats.iter().any(|c| c.in_flight))
+            .count()
+    }
+
+    /// Total cost across every chat (shown only via :cost — codex-simple).
+    pub fn total_cost(&self) -> f64 {
+        self.spaces
+            .iter()
+            .map(|s| s.chats.iter().map(|c| c.cost).sum::<f64>())
+            .sum()
+    }
+
+    /// The focused chat's diffs, newest first: (file, +lines, −lines,
+    /// transcript index of the Diff entry).
+    /// Every diff in this chat flattened into ONE scrollable document,
+    /// oldest first, each file introduced by a separator row (Saxon,
+    /// 2026-08-27: "any file that is changed in the session should be able to
+    /// see the diff, and while i scroll if i go to a different file diff it
+    /// will go to said file and rename the header").
+    ///
+    /// Each row carries its own file, so the header is just a lookup of
+    /// whatever row sits at the top of the viewport — the name can never
+    /// drift out of sync with what's on screen.
+    /// Rebuild the pad's document only when the underlying chat actually
+    /// changed. The document owns copies of its rows, so building it per
+    /// frame (which the first cut did — twice, since the starts list rebuilt
+    /// it too) meant cloning every diff line ~60×/second for as long as the
+    /// pad was open. Keyed on (chat id, rev) so switching chats or a new edit
+    /// arriving refreshes it, and nothing else does.
+    pub fn sync_diff_doc(&mut self) {
+        let key = (self.chat().id, self.chat().rev);
+        if self.diff_key == Some(key) {
+            return;
+        }
+
+        // Only the most recent PAD_MAX_FILES files are held. A long session
+        // can touch hundreds of files, and the pad is for reviewing what just
+        // happened — the cap bounds both the build cost and what the pad
+        // retains, without touching what's stored in the transcript.
+        let all: Vec<&Entry> = self
+            .chat()
+            .transcript
+            .iter()
+            .filter(|e| matches!(e, Entry::Diff { .. }))
+            .collect();
+        let elided = all.len().saturating_sub(PAD_MAX_FILES);
+
+        let mut rows = Vec::new();
+        let mut starts = Vec::new();
+        for e in all.into_iter().skip(elided) {
+            let Entry::Diff { file, added, removed, lines } = e else { continue };
+            starts.push(rows.len());
+            rows.push(DocRow {
+                file: file.clone(),
+                added: *added,
+                removed: *removed,
+                line: None,
+            });
+            for l in lines {
+                rows.push(DocRow {
+                    file: file.clone(),
+                    added: *added,
+                    removed: *removed,
+                    line: Some(l.clone()),
+                });
+            }
+        }
+        self.diff_rows = rows;
+        self.diff_starts = starts;
+        self.diff_elided = elided;
+        self.diff_key = Some(key);
+    }
+
+    /// Drop the cached document when the pad closes — it can be a few hundred
+    /// KB and nothing reads it while the overlay is down.
+    fn clear_diff_doc(&mut self) {
+        self.diff_rows = Vec::new();
+        self.diff_starts = Vec::new();
+        self.diff_key = None;
+        self.diff_elided = 0;
     }
 
     /// Flip mouse capture. OFF lets the cursor select/copy text (tmux/Ghostty
@@ -724,16 +1141,25 @@ impl App {
     }
 
     pub fn persist(&self) {
-        let data = vec![PersistSpace {
-            name: String::new(),
-            chats: vec![PersistChat {
-                title: self.chat.title.clone(),
-                session_id: self.chat.session_id.clone(),
-                cost: self.chat.cost,
-                started: !self.chat.first_turn,
-                transcript: self.chat.transcript.clone(),
-            }],
-        }];
+        let data: Vec<PersistSpace> = self
+            .spaces
+            .iter()
+            .map(|sp| PersistSpace {
+                name: space_name(sp),
+                dir: Some(sp.dir.display().to_string()),
+                chats: sp
+                    .chats
+                    .iter()
+                    .map(|c| PersistChat {
+                        title: String::new(),
+                        session_id: c.session_id.clone(),
+                        cost: c.cost,
+                        started: !c.first_turn,
+                        transcript: c.transcript.clone(),
+                    })
+                    .collect(),
+            })
+            .collect();
         store::save(&self.workspace_key, &data);
     }
 
@@ -751,8 +1177,8 @@ impl App {
             Msg::Input(Event::Paste(s)) => self.paste(s),
             Msg::Input(_) => {}
             Msg::Pasted(s) => self.paste(s),
-            Msg::Agent { ev, .. } => self.handle_agent(ev),
-            Msg::SessionEnded { error, .. } => self.session_ended(error),
+            Msg::Agent { chat, ev } => self.handle_agent(chat, ev),
+            Msg::SessionEnded { chat, error } => self.session_ended(chat, error),
         }
         self.dirty = true;
     }
@@ -760,13 +1186,16 @@ impl App {
     /// The claude child exited. A clean exit (deliberate kill, stdin close) is
     /// quiet; a crash mid-turn surfaces the error. A stale `--resume`
     /// self-heals once by re-minting the session and replaying the last prompt.
-    fn session_ended(&mut self, error: Option<String>) {
+    fn session_ended(&mut self, chat: u64, error: Option<String>) {
+        let Some((si, ci)) = self.find_chat(chat) else {
+            return; // chat was deleted while its child wound down
+        };
         if error
             .as_deref()
             .is_some_and(|e| e.contains("No conversation found with session ID"))
         {
             let replay = {
-                let c = &mut self.chat;
+                let c = &mut self.spaces[si].chats[ci];
                 c.session = None;
                 if !c.healed_once && c.last_prompt.is_some() {
                     c.healed_once = true;
@@ -783,11 +1212,11 @@ impl App {
                 }
             };
             if let Some(p) = replay {
-                self.deliver(p, false);
+                self.deliver(si, ci, p, false);
                 return;
             }
         }
-        let c = &mut self.chat;
+        let c = &mut self.spaces[si].chats[ci];
         c.session = None;
         let was_interrupting = c.interrupting;
         c.interrupting = false;
@@ -808,12 +1237,15 @@ impl App {
         }
         c.trim();
         self.persist();
-        self.drain_queue();
+        self.drain_queue(si, ci);
     }
 
-    fn handle_agent(&mut self, ev: AgentEvent) {
+    fn handle_agent(&mut self, chat: u64, ev: AgentEvent) {
+        let Some((si, ci)) = self.find_chat(chat) else {
+            return; // late event for a deleted chat
+        };
         let is_result = matches!(ev, AgentEvent::TurnResult { .. });
-        let c = &mut self.chat;
+        let c = &mut self.spaces[si].chats[ci];
         match ev {
             AgentEvent::Init { session_id, model, slash_commands } => {
                 if let Some(s) = session_id {
@@ -901,7 +1333,7 @@ impl App {
         }
         if is_result {
             self.persist();
-            self.drain_queue();
+            self.drain_queue(si, ci);
         }
     }
 
@@ -912,54 +1344,375 @@ impl App {
             return;
         }
         self.toast = None; // any keypress clears the statusline notice
-        let close_key = matches!(
-            k.code,
-            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char(' ')
-        );
-        if self.help_open {
-            self.help_open = false;
-            if close_key {
+        match self.overlay {
+            Overlay::Help => {
+                self.overlay = Overlay::None;
+                let close_key = matches!(
+                    k.code,
+                    KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char(' ')
+                );
+                if close_key {
+                    return;
+                }
+                // other keys close the overlay AND still do their thing
+            }
+            Overlay::Picker => {
+                self.key_picker(k);
                 return;
             }
-            // other keys close the overlay AND still do their thing
+            Overlay::DirPicker => {
+                self.key_dir_picker(k);
+                return;
+            }
+            Overlay::Board => {
+                self.key_board(k);
+                return;
+            }
+            Overlay::DiffPad => {
+                self.key_diffpad(k);
+                return;
+            }
+            Overlay::None => {}
         }
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         match self.mode {
-            Mode::Command => self.key_command(k, ctrl),
+            Mode::Normal => self.key_normal(k, ctrl),
             Mode::Rename => self.key_rename(k, ctrl),
             Mode::Insert => self.key_insert(k, ctrl),
+            Mode::Command => self.key_command(k, ctrl),
             Mode::Confirm => self.key_confirm(k),
-            Mode::Normal => {
-                if self.pending != Pending::None {
-                    self.handle_pending(k);
-                    return;
-                }
-                self.key_normal(k, ctrl);
-            }
         }
     }
 
-    fn key_command(&mut self, k: KeyEvent, ctrl: bool) {
+    // ---- Normal mode: navigate, jump sessions, drive the sidebar ----
+
+    fn key_normal(&mut self, k: KeyEvent, ctrl: bool) {
+        // multi-key sequences (gg/gt/gT/ga, Space leader) resolve first
+        let pend = self.pending;
+        self.pending = Pending::None;
+        match pend {
+            Pending::G => {
+                match k.code {
+                    KeyCode::Char('g') => self.scroll_top(),
+                    KeyCode::Char('t') => self.next_space(1),
+                    KeyCode::Char('T') => self.next_space(-1),
+                    KeyCode::Char('a') => self.open_picker(),
+                    KeyCode::Char('d') => self.open_dir_picker(),
+                    _ => {}
+                }
+                return;
+            }
+            Pending::Leader => {
+                match k.code {
+                    KeyCode::Char(c @ '1'..='9') => self.jump_space(c as usize - '1' as usize),
+                    KeyCode::Char('0') => self.jump_space(9),
+                    KeyCode::Char('e') => self.pending = Pending::LeaderE,
+                    KeyCode::Char('n') => self.new_space(),
+                    KeyCode::Char('t') => self.open_board(),
+                    KeyCode::Enter => self.send_prompt(),
+                    _ => {}
+                }
+                return;
+            }
+            Pending::LeaderE => {
+                match k.code {
+                    KeyCode::Char('e') => self.toggle_sidebar(),
+                    KeyCode::Char('f') => self.focus_sidebar(),
+                    _ => {}
+                }
+                return;
+            }
+            Pending::CtrlW => {
+                // vim window commands over the space's panes
+                match k.code {
+                    KeyCode::Char('v') | KeyCode::Char('s') => self.add_split(),
+                    KeyCode::Char('h') => self.focus_pane(0),
+                    KeyCode::Char('l') => self.focus_pane(1),
+                    KeyCode::Char('w') => self.cycle_pane(),
+                    KeyCode::Char('q') | KeyCode::Char('c') => self.close_focused_pane(),
+                    _ => {}
+                }
+                return;
+            }
+            Pending::None => {}
+        }
+        if ctrl {
+            match k.code {
+                KeyCode::Char('w') => self.pending = Pending::CtrlW,
+                // Ctrl-h/l walk sidebar ← pane ← → pane, like the old layout.
+                KeyCode::Char('h') => {
+                    let sp = self.space();
+                    if self.focus == Focus::Main && sp.chats.len() > 1 && sp.focused > 0 {
+                        self.focus_pane(0);
+                    } else {
+                        self.focus_sidebar();
+                    }
+                }
+                KeyCode::Char('l') => {
+                    if self.focus == Focus::Sidebar {
+                        self.focus = Focus::Main;
+                    } else {
+                        self.focus_pane(1);
+                    }
+                }
+                KeyCode::Char('j') if self.focus == Focus::Sidebar => self.sidebar_move(1),
+                KeyCode::Char('k') if self.focus == Focus::Sidebar => self.sidebar_move(-1),
+                KeyCode::Char('d') => self.scroll_down(12),
+                KeyCode::Char('u') => self.scroll_up(12),
+                KeyCode::Char('t') => {
+                    let c = self.chat_mut();
+                    c.expand_tools = !c.expand_tools;
+                }
+                KeyCode::Char('c') => {
+                    if self.chat().in_flight {
+                        self.interrupt();
+                    } else {
+                        self.confirm_quit();
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
         match k.code {
             KeyCode::Esc => {
-                self.cmd.clear();
-                self.mode = Mode::Normal;
+                if self.chat().in_flight {
+                    self.interrupt();
+                } else {
+                    self.chat_mut().follow = true;
+                }
             }
-            KeyCode::Enter => self.exec_command(),
-            KeyCode::Backspace => {
-                let at = self.cmd.len();
-                let start = prev_grapheme(&self.cmd, at);
-                self.cmd.truncate(start);
+            KeyCode::Char('i') => self.enter_insert(false),
+            KeyCode::Char('a') => self.enter_insert(true),
+            KeyCode::Char('o') => {
+                self.enter_insert(true);
+                if !self.input.is_empty() {
+                    self.insert_at_cursor("\n");
+                }
             }
-            KeyCode::Char('c') if ctrl => {
-                self.cmd.clear();
-                self.mode = Mode::Normal;
+            KeyCode::Char(':') => {
+                self.cmdline.clear();
+                self.mode = Mode::Command;
             }
-            KeyCode::Char('u') if ctrl => self.cmd.clear(),
-            KeyCode::Char('v') if ctrl => self.paste_from_clipboard(),
-            KeyCode::Char(c) => self.cmd.push(c),
+            KeyCode::Char('/') => {
+                self.enter_insert(true);
+                if self.input.is_empty() {
+                    self.insert_at_cursor("/");
+                }
+            }
+            KeyCode::Char(' ') => self.pending = Pending::Leader,
+            KeyCode::Char('g') => self.pending = Pending::G,
+            KeyCode::Char('G') | KeyCode::End => self.chat_mut().follow = true,
+            KeyCode::Home => self.scroll_top(),
+            KeyCode::Char('j') | KeyCode::Down => match self.focus {
+                Focus::Sidebar => self.sidebar_move(1),
+                Focus::Main => self.scroll_down(1),
+            },
+            KeyCode::Char('k') | KeyCode::Up => match self.focus {
+                Focus::Sidebar => self.sidebar_move(-1),
+                Focus::Main => self.scroll_up(1),
+            },
+            KeyCode::PageDown => self.scroll_down(12),
+            KeyCode::PageUp => self.scroll_up(12),
+            KeyCode::Enter if self.focus == Focus::Sidebar => {
+                self.jump_space(self.sidebar_cursor)
+            }
+            KeyCode::Char('n') if self.focus == Focus::Sidebar => self.new_space(),
+            KeyCode::Char('d') if self.focus == Focus::Sidebar => {
+                self.confirm_delete_space(self.sidebar_cursor)
+            }
+            KeyCode::Char('r') => {
+                let target = if self.focus == Focus::Sidebar {
+                    self.sidebar_cursor
+                } else {
+                    self.active
+                };
+                self.start_rename(target);
+            }
+            KeyCode::Char('?') | KeyCode::F(1) => self.overlay = Overlay::Help,
             _ => {}
         }
+    }
+
+    fn enter_insert(&mut self, at_end: bool) {
+        self.focus = Focus::Main;
+        self.mode = Mode::Insert;
+        if at_end {
+            self.input_cursor = self.input.len();
+        }
+    }
+
+    fn scroll_top(&mut self) {
+        let c = self.chat_mut();
+        c.follow = false;
+        c.scroll = 0;
+    }
+
+    // ---- sidebar, spaces & panes ----
+
+    fn toggle_sidebar(&mut self) {
+        self.sidebar_open = !self.sidebar_open;
+        if self.sidebar_open {
+            self.focus_sidebar();
+        } else {
+            self.focus = Focus::Main;
+        }
+    }
+
+    fn focus_sidebar(&mut self) {
+        self.sidebar_open = true;
+        self.sidebar_cursor = self.active.min(self.spaces.len().saturating_sub(1));
+        self.focus = Focus::Sidebar;
+        self.mode = Mode::Normal;
+    }
+
+    fn sidebar_move(&mut self, d: isize) {
+        let n = self.spaces.len();
+        if n == 0 {
+            return;
+        }
+        let cur = self.sidebar_cursor.min(n - 1) as isize;
+        self.sidebar_cursor = (cur + d).rem_euclid(n as isize) as usize;
+    }
+
+    fn jump_space(&mut self, idx: usize) {
+        if idx < self.spaces.len() {
+            self.active = idx;
+            self.sidebar_cursor = idx;
+            self.focus = Focus::Main;
+        } else {
+            self.toast = Some(format!("no space {}", idx + 1));
+        }
+    }
+
+    fn next_space(&mut self, d: isize) {
+        let n = self.spaces.len();
+        if n == 0 {
+            return;
+        }
+        let next = (self.active as isize + d).rem_euclid(n as isize) as usize;
+        self.jump_space(next);
+    }
+
+    fn new_space(&mut self) {
+        let c = Chat::fresh(self.next_id);
+        self.next_id += 1;
+        self.spaces.push(Space::of(c));
+        self.jump_space(self.spaces.len() - 1);
+        self.mode = Mode::Insert; // a fresh space: start typing
+        self.persist();
+    }
+
+    /// `:vs` / Ctrl-w v — add a second chat pane to the active space.
+    fn add_split(&mut self) {
+        if self.space().chats.len() >= 2 {
+            self.toast = Some("space already has two chats".into());
+            return;
+        }
+        let c = Chat::fresh(self.next_id);
+        self.next_id += 1;
+        let sp = self.space_mut();
+        sp.chats.push(c);
+        sp.focused = sp.chats.len() - 1;
+        self.focus = Focus::Main;
+        self.mode = Mode::Insert; // new pane: start typing
+        self.persist();
+    }
+
+    fn focus_pane(&mut self, pane: usize) {
+        let sp = self.space_mut();
+        if pane < sp.chats.len() {
+            sp.focused = pane;
+        }
+        self.focus = Focus::Main;
+    }
+
+    fn cycle_pane(&mut self) {
+        let sp = self.space_mut();
+        if sp.chats.len() > 1 {
+            sp.focused = (sp.focused + 1) % sp.chats.len();
+        }
+        self.focus = Focus::Main;
+    }
+
+    /// `:q` / Ctrl-w q — close the focused pane; the space when that was its
+    /// last pane; the app when that was the last space. Straight vim window
+    /// semantics, and deliberately NOT confirmed (Saxon, 2026-08-27: ":q
+    /// should just quit, not ask to confirm quitting").
+    ///
+    /// The accident-prone paths still ask: Ctrl-c on an idle chat and Ctrl-D
+    /// on an empty composer both route through `confirm_quit`. Typing `:q` is
+    /// deliberate in a way that a stray control key is not.
+    fn close_focused_pane(&mut self) {
+        if self.space().chats.len() > 1 {
+            let ci = self.space().focused;
+            self.close_pane(self.active, ci);
+        } else if self.spaces.len() > 1 {
+            self.delete_space(self.active);
+        } else {
+            // Last pane of the last space: nothing left to return to.
+            self.should_quit = true;
+        }
+    }
+
+    fn close_pane(&mut self, si: usize, ci: usize) {
+        let Some(sp) = self.spaces.get_mut(si) else { return };
+        if ci >= sp.chats.len() || sp.chats.len() == 1 {
+            return;
+        }
+        let mut c = sp.chats.remove(ci);
+        if let Some(s) = c.session.take() {
+            s.kill();
+        }
+        sp.focused = sp.focused.min(sp.chats.len() - 1);
+        self.persist();
+    }
+
+    fn confirm_delete_space(&mut self, idx: usize) {
+        if idx >= self.spaces.len() {
+            return;
+        }
+        let name = space_name(&self.spaces[idx]);
+        let running = if self.spaces[idx].chats.iter().any(|c| c.in_flight) {
+            " — a turn is running"
+        } else {
+            ""
+        };
+        self.confirm_msg = format!("delete space \"{name}\"{running}?   y / n");
+        self.confirm_what = ConfirmWhat::DeleteSpace(idx);
+        self.mode = Mode::Confirm;
+    }
+
+    fn delete_space(&mut self, idx: usize) {
+        if idx >= self.spaces.len() {
+            return;
+        }
+        let mut sp = self.spaces.remove(idx);
+        for c in &mut sp.chats {
+            if let Some(s) = c.session.take() {
+                s.kill();
+            }
+        }
+        if self.spaces.is_empty() {
+            self.spaces.push(Space::of(Chat::fresh(self.next_id)));
+            self.next_id += 1;
+        }
+        if self.active > idx {
+            self.active -= 1;
+        }
+        self.active = self.active.min(self.spaces.len() - 1);
+        self.sidebar_cursor = self.sidebar_cursor.min(self.spaces.len() - 1);
+        self.persist();
+    }
+
+    fn start_rename(&mut self, idx: usize) {
+        if idx >= self.spaces.len() {
+            return;
+        }
+        self.rename_target = idx;
+        let t = &self.spaces[idx].name;
+        self.rename_buf = if is_default_name(t) { String::new() } else { t.clone() };
+        self.mode = Mode::Rename;
     }
 
     fn key_rename(&mut self, k: KeyEvent, ctrl: bool) {
@@ -968,7 +1721,9 @@ impl App {
             KeyCode::Enter => {
                 let name = self.rename_buf.trim().to_string();
                 if !name.is_empty() {
-                    self.chat.title = name;
+                    if let Some(sp) = self.spaces.get_mut(self.rename_target) {
+                        sp.name = name;
+                    }
                 }
                 self.mode = Mode::Normal;
                 self.persist();
@@ -984,6 +1739,397 @@ impl App {
             KeyCode::Char(c) => self.rename_buf.push(c),
             _ => {}
         }
+    }
+
+    // ---- Command mode (`:`) ----
+
+    fn key_command(&mut self, k: KeyEvent, ctrl: bool) {
+        match k.code {
+            KeyCode::Esc => self.mode = Mode::Normal,
+            KeyCode::Char('c') if ctrl => self.mode = Mode::Normal,
+            KeyCode::Char('u') if ctrl => self.cmdline.clear(),
+            KeyCode::Char('v') if ctrl => self.paste_from_clipboard(),
+            KeyCode::Enter => {
+                let cmd = self.cmdline.trim().to_string();
+                self.cmdline.clear();
+                self.mode = Mode::Normal;
+                self.exec_command(&cmd);
+            }
+            KeyCode::Backspace => {
+                if self.cmdline.is_empty() {
+                    self.mode = Mode::Normal;
+                } else {
+                    let at = self.cmdline.len();
+                    let start = prev_grapheme(&self.cmdline, at);
+                    self.cmdline.truncate(start);
+                }
+            }
+            KeyCode::Char(c) if !ctrl => self.cmdline.push(c),
+            _ => {}
+        }
+    }
+
+    fn exec_command(&mut self, cmd: &str) {
+        if cmd.is_empty() {
+            return;
+        }
+        // `:3` jumps to space 3, like `:b 3`.
+        if let Ok(n) = cmd.parse::<usize>() {
+            if n >= 1 {
+                self.jump_space(n - 1);
+            }
+            return;
+        }
+        let mut parts = cmd.splitn(2, char::is_whitespace);
+        let head = parts.next().unwrap_or("");
+        let arg = parts.next().unwrap_or("").trim();
+        match head {
+            // vim window semantics: :q closes the focused pane (then the
+            // space, then the app); :qa quits outright. Neither prompts —
+            // typing the command IS the confirmation.
+            "q" => self.close_focused_pane(),
+            "qa" => self.should_quit = true,
+            "q!" | "qa!" | "quit" => self.should_quit = true,
+            "vs" | "vsplit" | "sp" | "split" => self.add_split(),
+            "new" | "n" => self.new_space(),
+            "bd" => self.confirm_delete_space(self.active),
+            // `:cd <path>` moves this space; bare `:cd` opens the picker.
+            // `:cd -` is the shell idiom for "back where I was".
+            "cd" => {
+                if arg.is_empty() {
+                    self.open_dir_picker();
+                } else if arg == "-" {
+                    match self.prev_dir.clone() {
+                        Some(p) if p.is_dir() => self.set_space_dir(p),
+                        _ => self.toast = Some("no previous directory".into()),
+                    }
+                } else {
+                    let base = self.space().dir.clone();
+                    match resolve_dir(arg, &base) {
+                        Some(p) => self.set_space_dir(p),
+                        None => self.toast = Some(format!("not a directory: {arg}")),
+                    }
+                }
+            }
+            "pwd" => self.toast = Some(tilde(&self.space().dir)),
+            "clear" => self.reset_conversation(),
+            "tasks" | "board" => self.open_board(),
+            "diff" => self.open_diff_pad(),
+            "cost" => {
+                let sp: f64 = self.space().chats.iter().map(|c| c.cost).sum();
+                self.toast = Some(format!(
+                    "this space ${:.2} · all spaces ${:.2}",
+                    sp,
+                    self.total_cost()
+                ));
+            }
+            "status" => {
+                let perm = if self.dangerous { "dangerous" } else { "acceptEdits" };
+                let sid = &self.chat().session_id[..8.min(self.chat().session_id.len())];
+                self.toast = Some(format!(
+                    "{} · {perm} · {} spaces · {sid} · ${:.2}",
+                    self.model_display,
+                    self.spaces.len(),
+                    self.total_cost()
+                ));
+            }
+            "rename" => {
+                if arg.is_empty() {
+                    self.start_rename(self.active);
+                } else {
+                    self.space_mut().name = arg.to_string();
+                    self.persist();
+                }
+            }
+            "help" => self.overlay = Overlay::Help,
+            "mouse" => self.toggle_mouse(),
+            "tools" => {
+                let c = self.chat_mut();
+                c.expand_tools = !c.expand_tools;
+            }
+            _ => self.toast = Some(format!(":{head}? unknown command")),
+        }
+    }
+
+    // ---- :diff pad ----
+
+    fn open_diff_pad(&mut self) {
+        self.sync_diff_doc();
+        let Some(&last) = self.diff_starts.last() else {
+            self.clear_diff_doc();
+            self.toast = Some("no diffs in this chat yet".into());
+            return;
+        };
+        // Open on the newest change, with the whole session's history
+        // scrollable above it.
+        self.diff_scroll = last;
+        self.overlay = Overlay::DiffPad;
+        self.mode = Mode::Normal;
+    }
+
+    fn key_diffpad(&mut self, k: KeyEvent) {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        let starts = self.diff_starts.clone();
+        if starts.is_empty() {
+            self.overlay = Overlay::None;
+            self.clear_diff_doc();
+            return;
+        }
+        match k.code {
+            KeyCode::Esc | KeyCode::Char('q') if !ctrl => {
+                self.overlay = Overlay::None;
+                self.clear_diff_doc();
+            }
+            // Ctrl-j/k jump whole files; j/k scroll the continuous document.
+            KeyCode::Char('j') | KeyCode::Down if ctrl => {
+                self.diff_scroll = starts
+                    .iter()
+                    .copied()
+                    .find(|&s| s > self.diff_scroll)
+                    .unwrap_or(self.diff_scroll);
+            }
+            KeyCode::Char('k') | KeyCode::Up if ctrl => {
+                self.diff_scroll = starts
+                    .iter()
+                    .copied()
+                    .rev()
+                    .find(|&s| s < self.diff_scroll)
+                    .unwrap_or(0);
+            }
+            KeyCode::Char('j') | KeyCode::Down => self.diff_scroll += 1,
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.diff_scroll = self.diff_scroll.saturating_sub(1)
+            }
+            KeyCode::Char('d') if ctrl => self.diff_scroll += 12,
+            KeyCode::Char('u') if ctrl => {
+                self.diff_scroll = self.diff_scroll.saturating_sub(12)
+            }
+            KeyCode::Char('g') => self.diff_scroll = 0,
+            KeyCode::Char('G') => self.diff_scroll = usize::MAX, // clamped in render
+            _ => {}
+        }
+    }
+
+    // ---- ga fuzzy picker ----
+
+    fn open_picker(&mut self) {
+        self.picker_query.clear();
+        self.picker_sel = 0;
+        self.overlay = Overlay::Picker;
+        self.mode = Mode::Normal;
+    }
+
+    /// Case-insensitive subsequence match over space names; returns (space
+    /// index, matched char positions) per hit, busy spaces first.
+    pub fn picker_matches(&self) -> Vec<(usize, Vec<usize>)> {
+        let q: Vec<char> = self.picker_query.to_lowercase().chars().collect();
+        let mut out: Vec<(usize, Vec<usize>)> = Vec::new();
+        for (i, sp) in self.spaces.iter().enumerate() {
+            let title = space_name(sp).to_lowercase();
+            let mut pos = Vec::new();
+            let mut qi = 0;
+            for (ci, ch) in title.chars().enumerate() {
+                if qi < q.len() && ch == q[qi] {
+                    pos.push(ci);
+                    qi += 1;
+                }
+            }
+            if qi == q.len() {
+                out.push((i, pos));
+            }
+        }
+        out.sort_by_key(|(i, _)| self.spaces[*i].status() != ChatStatus::Running);
+        out
+    }
+
+    fn key_picker(&mut self, k: KeyEvent) {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        match k.code {
+            KeyCode::Esc => self.overlay = Overlay::None,
+            KeyCode::Enter => {
+                let m = self.picker_matches();
+                let pick = m
+                    .get(self.picker_sel.min(m.len().saturating_sub(1)))
+                    .map(|(i, _)| *i);
+                self.overlay = Overlay::None;
+                if let Some(idx) = pick {
+                    self.jump_space(idx);
+                }
+            }
+            KeyCode::Down => self.picker_move(1),
+            KeyCode::Up => self.picker_move(-1),
+            KeyCode::Char('j') | KeyCode::Char('n') if ctrl => self.picker_move(1),
+            KeyCode::Char('k') | KeyCode::Char('p') if ctrl => self.picker_move(-1),
+            KeyCode::Backspace => {
+                let at = self.picker_query.len();
+                let start = prev_grapheme(&self.picker_query, at);
+                self.picker_query.truncate(start);
+                self.picker_sel = 0;
+            }
+            KeyCode::Char(c) if !ctrl => {
+                self.picker_query.push(c);
+                self.picker_sel = 0;
+            }
+            _ => {}
+        }
+    }
+
+    fn picker_move(&mut self, d: isize) {
+        let n = self.picker_matches().len();
+        if n == 0 {
+            return;
+        }
+        let cur = self.picker_sel.min(n - 1) as isize;
+        self.picker_sel = (cur + d).rem_euclid(n as isize) as usize;
+    }
+
+    // ---- gd fuzzy directory picker ----
+
+    /// `gd` / bare `:cd`. Scans on open rather than on every keystroke — the
+    /// walk is bounded (see `scan_dirs`) but not free.
+    fn open_dir_picker(&mut self) {
+        self.dir_candidates = scan_dirs();
+        self.dir_query.clear();
+        self.dir_sel = 0;
+        self.overlay = Overlay::DirPicker;
+        self.mode = Mode::Normal;
+    }
+
+    /// Case-insensitive subsequence match over the `~/…` form, same rule as
+    /// the space picker. Shortest paths first, so `~/aeovim` outranks a deep
+    /// path that happens to contain the same letters.
+    pub fn dir_matches(&self) -> Vec<(usize, Vec<usize>)> {
+        let q: Vec<char> = self.dir_query.to_lowercase().chars().collect();
+        let mut out: Vec<(usize, Vec<usize>)> = Vec::new();
+        for (i, p) in self.dir_candidates.iter().enumerate() {
+            let hay = tilde(p).to_lowercase();
+            let mut pos = Vec::new();
+            let mut qi = 0;
+            for (ci, ch) in hay.chars().enumerate() {
+                if qi < q.len() && ch == q[qi] {
+                    pos.push(ci);
+                    qi += 1;
+                }
+            }
+            if qi == q.len() {
+                out.push((i, pos));
+            }
+        }
+        out.sort_by_key(|(i, _)| tilde(&self.dir_candidates[*i]).len());
+        out.truncate(200);
+        out
+    }
+
+    fn key_dir_picker(&mut self, k: KeyEvent) {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        match k.code {
+            KeyCode::Esc => self.overlay = Overlay::None,
+            KeyCode::Enter => {
+                let m = self.dir_matches();
+                let pick = m
+                    .get(self.dir_sel.min(m.len().saturating_sub(1)))
+                    .map(|(i, _)| self.dir_candidates[*i].clone());
+                self.overlay = Overlay::None;
+                if let Some(p) = pick {
+                    self.set_space_dir(p);
+                }
+            }
+            KeyCode::Down => self.dir_move(1),
+            KeyCode::Up => self.dir_move(-1),
+            KeyCode::Char('j') | KeyCode::Char('n') if ctrl => self.dir_move(1),
+            KeyCode::Char('k') | KeyCode::Char('p') if ctrl => self.dir_move(-1),
+            KeyCode::Backspace => {
+                let at = self.dir_query.len();
+                let start = prev_grapheme(&self.dir_query, at);
+                self.dir_query.truncate(start);
+                self.dir_sel = 0;
+            }
+            KeyCode::Char(c) if !ctrl => {
+                self.dir_query.push(c);
+                self.dir_sel = 0;
+            }
+            _ => {}
+        }
+    }
+
+    fn dir_move(&mut self, d: isize) {
+        let n = self.dir_matches().len();
+        if n == 0 {
+            return;
+        }
+        let cur = self.dir_sel.min(n - 1) as isize;
+        self.dir_sel = (cur + d).rem_euclid(n as isize) as usize;
+    }
+
+    /// Point this space at `dir`. Live claude children keep the cwd they were
+    /// spawned with, so they are killed here: the next turn respawns in the
+    /// new directory (`--resume` keeps the conversation). Without this the
+    /// header would claim a directory the agent isn't actually working in.
+    fn set_space_dir(&mut self, dir: PathBuf) {
+        let shown = tilde(&dir);
+        let idx = self.active;
+        let Some(sp) = self.spaces.get_mut(idx) else { return };
+        if sp.dir == dir {
+            self.toast = Some(format!("already in {shown}"));
+            return;
+        }
+        self.prev_dir = Some(std::mem::replace(&mut sp.dir, dir));
+        let mut restarted = 0;
+        for c in &mut sp.chats {
+            if let Some(s) = c.session.take() {
+                s.kill();
+                restarted += 1;
+            }
+        }
+        self.persist();
+        self.toast = Some(match restarted {
+            0 => format!("space dir → {shown}"),
+            1 => format!("space dir → {shown} · session restarts on next turn"),
+            n => format!("space dir → {shown} · {n} sessions restart on next turn"),
+        });
+    }
+
+    // ---- task board ----
+
+    fn open_board(&mut self) {
+        let rows = self.board_rows();
+        self.board_sel = rows
+            .iter()
+            .position(|(si, _)| *si == self.active)
+            .unwrap_or(0);
+        self.overlay = Overlay::Board;
+        self.mode = Mode::Normal;
+    }
+
+    fn key_board(&mut self, k: KeyEvent) {
+        match k.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.overlay = Overlay::None,
+            KeyCode::Char('j') | KeyCode::Down => self.board_move(1),
+            KeyCode::Char('k') | KeyCode::Up => self.board_move(-1),
+            KeyCode::Enter => {
+                let rows = self.board_rows();
+                self.overlay = Overlay::None;
+                if let Some((si, ci)) = rows.get(self.board_sel).copied() {
+                    self.jump_space(si);
+                    self.spaces[si].focused = ci;
+                }
+            }
+            KeyCode::Char('x') => {
+                if let Some((si, ci)) = self.board_rows().get(self.board_sel).copied() {
+                    self.interrupt_at(si, ci);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn board_move(&mut self, d: isize) {
+        let n = self.board_rows().len();
+        if n == 0 {
+            return;
+        }
+        let cur = self.board_sel.min(n - 1) as isize;
+        self.board_sel = (cur + d).rem_euclid(n as isize) as usize;
     }
 
     fn key_insert(&mut self, k: KeyEvent, ctrl: bool) {
@@ -1015,6 +2161,8 @@ impl App {
             }
         }
         match k.code {
+            // Esc: back to Normal mode, vim-style — the draft stays (Ctrl-u
+            // clears it). Interrupt lives on Ctrl-c, and on Esc in Normal.
             KeyCode::Esc => self.mode = Mode::Normal,
             // Shift/Alt+Enter inserts a newline (the box grows); plain Enter sends.
             KeyCode::Enter
@@ -1028,10 +2176,31 @@ impl App {
             KeyCode::Delete => self.delete_at_cursor(),
             KeyCode::Left => self.cursor_left(),
             KeyCode::Right => self.cursor_right(),
-            KeyCode::Up => self.cursor_vertical(-1),
-            KeyCode::Down => self.cursor_vertical(1),
+            // Arrows scroll the transcript when there's nothing to edit;
+            // otherwise they move the cursor through the draft.
+            KeyCode::Up => {
+                if self.input.is_empty() {
+                    self.scroll_up(1);
+                } else {
+                    self.cursor_vertical(-1);
+                }
+            }
+            KeyCode::Down => {
+                if self.input.is_empty() {
+                    self.scroll_down(1);
+                } else {
+                    self.cursor_vertical(1);
+                }
+            }
             KeyCode::Home => self.cursor_line_home(),
-            KeyCode::End => self.cursor_line_end(),
+            KeyCode::End => {
+                if self.input.is_empty() {
+                    self.chat_mut().follow = true; // jump to the live tail
+                } else {
+                    self.cursor_line_end();
+                }
+            }
+            KeyCode::F(1) => self.overlay = Overlay::Help,
             KeyCode::Char('a') if ctrl => self.cursor_line_home(),
             KeyCode::Char('e') if ctrl => self.cursor_line_end(),
             KeyCode::Char('w') if ctrl => self.delete_word_back(),
@@ -1041,18 +2210,30 @@ impl App {
                 self.slash_sel = 0;
             }
             KeyCode::Char('v') if ctrl => self.paste_from_clipboard(),
-            KeyCode::Char('d') if ctrl => self.scroll_down(8),
-            // Ctrl-C never quits from Insert: it clears the draft, or interrupts
-            // the running turn, or drops to Normal — in that order.
+            KeyCode::Char('t') if ctrl => {
+                let c = self.chat_mut();
+                c.expand_tools = !c.expand_tools;
+            }
+            // Ctrl-D: readline delete-char-or-EOF — quits (asks) on an empty
+            // composer, deletes under the cursor otherwise.
+            KeyCode::Char('d') if ctrl => {
+                if self.input.is_empty() {
+                    self.confirm_quit();
+                } else {
+                    self.delete_at_cursor();
+                }
+            }
+            // Ctrl-C: clear the draft, or interrupt the running turn, or ask to
+            // quit — in that order.
             KeyCode::Char('c') if ctrl => {
                 if !self.input.is_empty() {
                     self.input.clear();
                     self.input_cursor = 0;
                     self.slash_sel = 0;
-                } else if self.chat.in_flight {
+                } else if self.chat().in_flight {
                     self.interrupt();
                 } else {
-                    self.mode = Mode::Normal;
+                    self.confirm_quit();
                 }
             }
             KeyCode::PageUp => self.scroll_up(12),
@@ -1167,15 +2348,20 @@ impl App {
         self.slash_sel = 0;
     }
 
-    /// Ask before quitting — `q` used to kill the app (and the running turn)
-    /// with zero friction, which made stray Normal-mode typing catastrophic.
+    /// Ask before quitting — quitting used to be zero-friction, which made a
+    /// stray keypress catastrophic mid-turn.
     fn confirm_quit(&mut self) {
-        self.confirm_msg = if self.chat.in_flight {
-            "quit aeovim? a turn is still running   y / n".to_string()
-        } else {
-            "quit aeovim?   y / n".to_string()
+        let running: usize = self
+            .spaces
+            .iter()
+            .map(|s| s.chats.iter().filter(|c| c.in_flight).count())
+            .sum();
+        self.confirm_msg = match running {
+            0 => "quit aeovim?   y / n".to_string(),
+            1 => "quit aeovim? a turn is still running   y / n".to_string(),
+            n => format!("quit aeovim? {n} turns are still running   y / n"),
         };
-        self.pending_quit = true;
+        self.confirm_what = ConfirmWhat::Quit;
         self.mode = Mode::Confirm;
     }
 
@@ -1183,6 +2369,7 @@ impl App {
         const DEFAULT: &[&str] = &[
             "init", "review", "security-review", "pr-comments", "compact", "context",
             "cost", "agents", "mcp", "memory", "model", "todos", "help", "clear",
+            "rename", "mouse", "tools", "quit",
         ];
         let mut v: Vec<String> = DEFAULT.iter().map(|s| s.to_string()).collect();
         for c in &self.slash_commands {
@@ -1232,111 +2419,22 @@ impl App {
     fn key_confirm(&mut self, k: KeyEvent) {
         match k.code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                if self.pending_quit {
-                    self.pending_quit = false;
-                    self.should_quit = true;
-                }
+                let what = self.confirm_what;
                 self.mode = Mode::Normal;
+                match what {
+                    ConfirmWhat::Quit => self.should_quit = true,
+                    ConfirmWhat::DeleteSpace(i) => self.delete_space(i),
+                }
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                self.pending_quit = false;
                 self.mode = Mode::Normal;
             }
             _ => {}
-        }
-    }
-
-    fn key_normal(&mut self, k: KeyEvent, ctrl: bool) {
-        match k.code {
-            // Esc/Ctrl-C while a turn runs = interrupt (Claude Code muscle
-            // memory). Ctrl-C when idle asks to quit.
-            KeyCode::Esc => {
-                if self.chat.in_flight {
-                    self.interrupt();
-                }
-            }
-            KeyCode::Char('c') if ctrl => {
-                if self.chat.in_flight {
-                    self.interrupt();
-                } else {
-                    self.confirm_quit();
-                }
-            }
-            KeyCode::Char('d') if ctrl => self.scroll_down(8),
-            KeyCode::Char('u') if ctrl => self.scroll_up(8),
-            KeyCode::Char('v') if ctrl => self.paste_from_clipboard(),
-            KeyCode::Char(' ') => self.pending = Pending::Leader,
-            KeyCode::Char(':') => {
-                self.cmd.clear();
-                self.mode = Mode::Command;
-            }
-            KeyCode::Char('i') | KeyCode::Char('a') => {
-                self.mode = Mode::Insert;
-            }
-            KeyCode::Char('o') => {
-                self.chat.follow = true;
-                self.mode = Mode::Insert;
-            }
-            KeyCode::Char('q') => self.confirm_quit(),
-            KeyCode::Char('r') => {
-                self.rename_buf = if is_default_name(&self.chat.title) {
-                    String::new()
-                } else {
-                    self.chat.title.clone()
-                };
-                self.mode = Mode::Rename;
-            }
-            KeyCode::Char('?') => self.help_open = true,
-            KeyCode::Char('g') => self.pending = Pending::G,
-            KeyCode::Char('z') => self.pending = Pending::Z,
-            KeyCode::Char('G') => self.chat.follow = true,
-            KeyCode::Char('}') => self.scroll_down(10),
-            KeyCode::Char('{') => self.scroll_up(10),
-            KeyCode::Char('j') | KeyCode::Down => self.scroll_down(1),
-            KeyCode::Char('k') | KeyCode::Up => self.scroll_up(1),
-            KeyCode::PageDown => self.scroll_down(12),
-            KeyCode::PageUp => self.scroll_up(12),
-            _ => {}
-        }
-    }
-
-    fn handle_pending(&mut self, k: KeyEvent) {
-        match self.pending {
-            Pending::G => {
-                self.pending = Pending::None;
-                if let KeyCode::Char('g') = k.code {
-                    self.chat.follow = false;
-                    self.chat.scroll = 0;
-                }
-            }
-            Pending::Z => {
-                self.pending = Pending::None;
-                match k.code {
-                    KeyCode::Char('z') => {
-                        // recenter on the newest activity (the working line)
-                        self.chat.follow = true;
-                    }
-                    KeyCode::Char('a') => {
-                        // za — vim fold toggle: expand/collapse tool results
-                        self.chat.expand_tools = !self.chat.expand_tools;
-                    }
-                    _ => {}
-                }
-            }
-            Pending::Leader => {
-                self.pending = Pending::None;
-                match k.code {
-                    KeyCode::Char('z') => self.help_open = true, // Space z(z)
-                    KeyCode::Char('e') => self.chat.expand_tools = !self.chat.expand_tools,
-                    _ => {}
-                }
-            }
-            Pending::None => {}
         }
     }
 
     fn scroll_down(&mut self, n: usize) {
-        let c = &mut self.chat;
+        let c = self.chat_mut();
         if c.follow {
             return; // already pinned to the live tail
         }
@@ -1347,7 +2445,7 @@ impl App {
         }
     }
     fn scroll_up(&mut self, n: usize) {
-        let c = &mut self.chat;
+        let c = self.chat_mut();
         if c.follow {
             c.scroll = c.last_max_scroll;
             c.follow = false;
@@ -1365,38 +2463,48 @@ impl App {
         }
     }
 
-    fn exec_command(&mut self) {
-        let cmd = self.cmd.trim().to_string();
-        self.cmd.clear();
-        self.mode = Mode::Normal;
-        match cmd.as_str() {
-            "q" | "q!" | "qa" | "qa!" | "quit" => {
-                // Explicit :q is deliberate — no extra confirm.
-                self.should_quit = true;
-            }
-            "w" | "ws" | "write" => self.persist(),
-            "clear" => self.reset_conversation(),
-            "help" => self.help_open = true,
-            "rename" => {
-                self.rename_buf = if is_default_name(&self.chat.title) {
-                    String::new()
+    /// UI-owned slash commands, handled locally instead of being sent to the
+    /// agent. Returns true when `prompt` was consumed.
+    fn exec_local_slash(&mut self, prompt: &str) -> bool {
+        let mut parts = prompt.splitn(2, char::is_whitespace);
+        let head = parts.next().unwrap_or("");
+        let arg = parts.next().unwrap_or("").trim();
+        match head {
+            "/clear" => self.reset_conversation(),
+            "/help" | "/keys" => self.overlay = Overlay::Help,
+            "/quit" | "/exit" => self.should_quit = true, // explicit — no confirm
+            "/new" => self.new_space(),
+            "/tasks" | "/board" => self.open_board(),
+            "/diff" => self.open_diff_pad(),
+            "/rename" => {
+                if arg.is_empty() {
+                    self.start_rename(self.active);
                 } else {
-                    self.chat.title.clone()
-                };
-                self.mode = Mode::Rename;
+                    self.space_mut().name = arg.to_string();
+                    self.persist();
+                }
             }
-            "mouse" | "mouse toggle" => self.toggle_mouse(),
-            "mouse on" => self.set_mouse(true),
-            "mouse off" => self.set_mouse(false),
-            "" => {}
-            // Unknown commands used to vanish silently (:wq, :help → nothing).
-            other => self.toast = Some(format!("not a command: :{other}")),
+            "/mouse" => match arg {
+                "on" => self.set_mouse(true),
+                "off" => self.set_mouse(false),
+                _ => self.toggle_mouse(),
+            },
+            "/tools" => {
+                let c = self.chat_mut();
+                c.expand_tools = !c.expand_tools;
+            }
+            _ => return false,
         }
+        true
     }
 
-    fn env_prompt(&self) -> String {
-        let cwd = std::env::current_dir()
-            .map(|p| p.display().to_string())
+    /// Per-space, because each space has its own working directory — telling
+    /// the agent the process cwd would name a directory it isn't in.
+    fn env_prompt(&self, si: usize) -> String {
+        let cwd = self
+            .spaces
+            .get(si)
+            .map(|sp| sp.dir.display().to_string())
             .unwrap_or_default();
         format!(
             "You are running inside aeovim — a keyboard-driven terminal UI that wraps the \
@@ -1405,42 +2513,45 @@ Claude Code CLI. Working directory: {cwd}. You're in a terminal on macOS \
         )
     }
 
-    /// Make sure the chat has a live session child, spawning one if needed.
+    /// Make sure chat (si, ci) has a live child, spawning one if needed.
     /// Returns false if the spawn failed (an Error entry is pushed).
-    fn ensure_session(&mut self) -> bool {
-        if self.chat.session.as_ref().is_some_and(|s| s.is_alive()) {
+    fn ensure_session(&mut self, si: usize, ci: usize) -> bool {
+        let c = &self.spaces[si].chats[ci];
+        if c.session.as_ref().is_some_and(|s| s.is_alive()) {
             return true;
         }
         let spec = crate::agent::SessionSpec {
-            chat: CHAT_ID,
-            session_id: self.chat.session_id.clone(),
-            resume: !self.chat.first_turn,
+            chat: c.id,
+            session_id: c.session_id.clone(),
+            resume: !c.first_turn,
             model: self.model_cli.clone(),
             dangerous: self.dangerous,
             permission_mode: "acceptEdits".into(),
-            append_system_prompt: Some(self.env_prompt()),
+            append_system_prompt: Some(self.env_prompt(si)),
+            cwd: self.spaces[si].dir.clone(),
         };
         match crate::agent::spawn_session(spec, self.tx.clone()) {
             Ok(h) => {
-                self.chat.session = Some(h);
-                self.chat.first_turn = false;
+                let c = &mut self.spaces[si].chats[ci];
+                c.session = Some(h);
+                c.first_turn = false;
                 true
             }
             Err(e) => {
-                self.chat.push(Entry::Error(e.to_string()));
+                self.spaces[si].chats[ci].push(Entry::Error(e.to_string()));
                 false
             }
         }
     }
 
-    /// Deliver a prompt as a turn on the live session. Assumes the user entry
+    /// Deliver a prompt as a turn on chat (si, ci). Assumes the user entry
     /// (if any) is already on the transcript — the resume self-heal replays
     /// through here without re-pushing it.
-    fn deliver(&mut self, prompt: String, snap_to_bottom: bool) {
-        if !self.ensure_session() {
+    fn deliver(&mut self, si: usize, ci: usize, prompt: String, snap_to_bottom: bool) {
+        if !self.ensure_session(si, ci) {
             return;
         }
-        let c = &mut self.chat;
+        let c = &mut self.spaces[si].chats[ci];
         let sent = c
             .session
             .as_ref()
@@ -1461,11 +2572,19 @@ Claude Code CLI. Working directory: {cwd}. You're in a terminal on macOS \
         c.activity = Some("Thinking".into());
     }
 
-    /// Interrupt the in-flight turn. First press asks the child nicely (control
-    /// protocol — keeps the session alive); a second press while still
-    /// interrupting hard-kills the child.
+    /// Interrupt the focused chat's in-flight turn. First press asks the
+    /// child nicely (control protocol — keeps the session alive); a second
+    /// press while still interrupting hard-kills the child.
     fn interrupt(&mut self) {
-        let c = &mut self.chat;
+        let si = self.active;
+        let ci = self.spaces[si].focused.min(self.spaces[si].chats.len() - 1);
+        self.interrupt_at(si, ci);
+    }
+
+    fn interrupt_at(&mut self, si: usize, ci: usize) {
+        let Some(c) = self.spaces.get_mut(si).and_then(|s| s.chats.get_mut(ci)) else {
+            return;
+        };
         if !c.in_flight {
             return;
         }
@@ -1489,16 +2608,20 @@ Claude Code CLI. Working directory: {cwd}. You're in a terminal on macOS \
         }
     }
 
-    /// Stop the live child (used on quit so nothing runs on invisibly).
+    /// Stop every live child (used on quit so nothing runs on invisibly).
     pub fn kill_all_sessions(&mut self) {
-        if let Some(s) = self.chat.session.take() {
-            s.kill();
+        for sp in &mut self.spaces {
+            for c in &mut sp.chats {
+                if let Some(s) = c.session.take() {
+                    s.kill();
+                }
+            }
         }
     }
 
-    /// /clear · :clear — wipe the transcript and start a fresh claude session.
+    /// /clear · :clear — wipe the focused transcript, fresh claude session.
     fn reset_conversation(&mut self) {
-        let c = &mut self.chat;
+        let c = self.chat_mut();
         if let Some(s) = c.session.take() {
             s.kill();
         }
@@ -1518,8 +2641,7 @@ Claude Code CLI. Working directory: {cwd}. You're in a terminal on macOS \
 
     /// Insert pasted text into whatever's being edited. In the composer the
     /// newlines are preserved (the box grows); single-line fields flatten
-    /// newlines to spaces. A paste in Normal mode drops into the composer so
-    /// "I pasted" just works.
+    /// newlines to spaces.
     fn paste(&mut self, raw: String) {
         let text = sanitize_paste(&raw);
         if text.is_empty() {
@@ -1528,14 +2650,9 @@ Claude Code CLI. Working directory: {cwd}. You're in a terminal on macOS \
         let flat = || text.replace('\n', " ");
         match self.mode {
             Mode::Insert => self.insert_at_cursor(&text),
-            Mode::Command => self.cmd.push_str(&flat()),
             Mode::Rename => self.rename_buf.push_str(&flat()),
-            Mode::Normal => {
-                self.mode = Mode::Insert;
-                self.chat.follow = true;
-                self.insert_at_cursor(&text);
-            }
-            Mode::Confirm => {}
+            Mode::Command => self.cmdline.push_str(&flat()),
+            Mode::Normal | Mode::Confirm => {}
         }
     }
 
@@ -1562,49 +2679,72 @@ Claude Code CLI. Working directory: {cwd}. You're in a terminal on macOS \
         if prompt.is_empty() {
             return;
         }
-        if prompt == "/clear" {
-            self.input.clear();
-            self.input_cursor = 0;
-            self.reset_conversation();
-            return;
+        // A drafted ex command (":diff", ":vs", …) executes instead of being
+        // sent to the model — typing : straight from Insert is too natural a
+        // reflex to punish with a confused agent turn.
+        if let Some(cmd) = prompt.strip_prefix(':') {
+            let cmd = cmd.trim().to_string();
+            if !cmd.is_empty() {
+                self.input.clear();
+                self.input_cursor = 0;
+                self.slash_sel = 0;
+                self.exec_command(&cmd);
+                return;
+            }
+        }
+        if prompt.starts_with('/') {
+            let consumed = self.exec_local_slash(&prompt);
+            if consumed {
+                self.input.clear();
+                self.input_cursor = 0;
+                self.slash_sel = 0;
+                return;
+            }
         }
         self.input.clear();
         self.input_cursor = 0;
         self.slash_sel = 0;
         // Busy? Queue it (shown at the bottom) and send it when the turn frees
-        // up — turns on one session are strictly sequential.
-        if self.chat.in_flight {
-            self.chat.queue.push(prompt);
-            self.chat.follow = true;
+        // up — turns on one chat are strictly sequential.
+        let si = self.active;
+        let ci = self.spaces[si].focused.min(self.spaces[si].chats.len() - 1);
+        if self.spaces[si].chats[ci].in_flight {
+            let c = &mut self.spaces[si].chats[ci];
+            c.queue.push(prompt);
+            c.follow = true;
             return;
         }
         {
-            let c = &mut self.chat;
+            // Name the space off its first prompt.
+            if is_default_name(&self.spaces[si].name) {
+                self.spaces[si].name = slug(&prompt);
+            }
+            let c = &mut self.spaces[si].chats[ci];
             c.push(Entry::User(prompt.clone()));
             c.last_prompt = Some(prompt.clone());
             c.healed_once = false;
-            // Name the conversation off its first prompt.
-            if is_default_name(&c.title) {
-                c.title = slug(&prompt);
-            }
         }
-        self.deliver(prompt, true);
+        self.deliver(si, ci, prompt, true);
     }
 
-    /// A turn just ended — if prompts were queued while it ran, send the next
-    /// one. Runs one at a time; the following turn's end drains the rest.
-    fn drain_queue(&mut self) {
-        if self.chat.in_flight || self.chat.queue.is_empty() {
+    /// A turn just ended on chat (si, ci) — if prompts were queued while it
+    /// ran, send the next one. One at a time; the following turn's end drains
+    /// the rest.
+    fn drain_queue(&mut self, si: usize, ci: usize) {
+        let Some(c) = self.spaces.get(si).and_then(|s| s.chats.get(ci)) else {
+            return;
+        };
+        if c.in_flight || c.queue.is_empty() {
             return;
         }
-        let next = self.chat.queue.remove(0);
+        let next = self.spaces[si].chats[ci].queue.remove(0);
         {
-            let c = &mut self.chat;
+            let c = &mut self.spaces[si].chats[ci];
             c.push(Entry::User(next.clone()));
             c.last_prompt = Some(next.clone());
             c.healed_once = false;
         }
-        self.deliver(next, false);
+        self.deliver(si, ci, next, false);
     }
 }
 
@@ -1668,7 +2808,7 @@ mod tests {
     fn tool_results_land_under_their_calls() {
         // Two parallel tool calls; results arrive OUT of order — each must
         // still render under its own ● header (the old code appended blindly).
-        let mut c = Chat::blank("sid".into(), "t".into(), true, 0.0);
+        let mut c = Chat::blank(1, "sid".into(), true, 0.0);
         c.push(Entry::User("go".into()));
         let a_idx = c.transcript.len();
         c.push(Entry::Tool("● Bash(ls)".into()));
@@ -1698,7 +2838,7 @@ mod tests {
 
     #[test]
     fn unknown_tool_result_appends() {
-        let mut c = Chat::blank("sid".into(), "t".into(), true, 0.0);
+        let mut c = Chat::blank(1, "sid".into(), true, 0.0);
         c.push(Entry::User("go".into()));
         c.insert_tool_result("mystery", false, "boom".into());
         assert!(matches!(
@@ -1752,5 +2892,57 @@ mod tests {
         assert_eq!((a, r), (3, 0));
 
         assert!(build_diff("Bash", &serde_json::json!({"command":"ls"})).is_none());
+    }
+
+    fn pchat(sid: &str) -> PersistChat {
+        PersistChat {
+            title: String::new(),
+            session_id: sid.into(),
+            cost: 0.0,
+            started: true,
+            transcript: vec![],
+        }
+    }
+
+    fn app_with(restored: Vec<PersistSpace>) -> App {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        App::new(None, false, tx, "selftest".into(), restored)
+    }
+
+    /// Launching in a directory reopens the space already pointed at it,
+    /// rather than whatever space happened to be active on exit.
+    #[test]
+    fn launch_dir_reopens_that_dirs_space() {
+        let here = std::env::current_dir().unwrap();
+        let app = app_with(vec![
+            PersistSpace {
+                name: "elsewhere".into(),
+                dir: Some("/tmp".into()),
+                chats: vec![pchat("a")],
+            },
+            PersistSpace {
+                name: "this one".into(),
+                dir: Some(here.display().to_string()),
+                chats: vec![pchat("b")],
+            },
+        ]);
+        assert_eq!(app.space().name, "this one");
+        assert_eq!(app.space().dir, here);
+    }
+
+    /// A directory with no saved space gets a fresh one, and the saved spaces
+    /// are still there to switch back to.
+    #[test]
+    fn launch_dir_without_a_space_creates_one() {
+        let here = std::env::current_dir().unwrap();
+        let app = app_with(vec![PersistSpace {
+            name: "elsewhere".into(),
+            dir: Some("/tmp".into()),
+            chats: vec![pchat("a")],
+        }]);
+        assert_eq!(app.spaces.len(), 2);
+        assert_eq!(app.space().dir, here);
+        assert!(app.space().name.trim().is_empty(), "fresh space is unnamed");
+        assert_eq!(app.spaces[0].dir, std::path::PathBuf::from("/tmp"));
     }
 }

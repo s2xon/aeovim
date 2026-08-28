@@ -1,7 +1,9 @@
-//! Rendering — single-session surface, themed with the lilac palette from the
-//! user's nvim. Layout, top to bottom: header row · thin rule · open transcript
-//! (no box) · powerline statusline · composer. DeepSeek-TUI/Claude-Code shape:
-//! one conversation, everything visible, nothing to manage.
+//! Rendering — the redesigned multi-session surface, colour-token themed.
+//!
+//! Layout, per the design canvas: header row · thin rule · [ SESSIONS sidebar |
+//! transcript ] · powerline statusline · composer. Overlays: ga fuzzy picker,
+//! :tasks board, help, confirm. The sidebar is the pane that came back: one row
+//! per session with a status glyph (●/○ running flash, ✗ error, ✓ idle).
 //!
 //! Perf model (the CodeWhale lesson): the settled transcript is pre-wrapped
 //! into visual rows ONCE per change (`RenderCache`, keyed by rev/width/expand)
@@ -9,17 +11,18 @@
 //! tiny and rebuilt per frame.
 
 use ratatui::layout::{Constraint, Layout, Position, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{chat_title, App, Chat, DiffKind, Entry, Mode, Pending};
-use crate::theme as t;
+use crate::app::{space_name, App, Chat, ChatStatus, DiffKind, Entry, Focus, Mode, Overlay};
+use crate::theme;
 
 const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SEP_R: &str = "\u{e0b0}"; // powerline right-filled
+const SIDEBAR_W: u16 = 30;
 
 /// Pre-wrapped visual rows of the settled transcript. Rebuilt only when the
 /// transcript revision, pane width, or tool-expansion toggle changes.
@@ -80,13 +83,70 @@ fn truncate_width(s: &str, max: usize) -> String {
     out
 }
 
+/// Pad or truncate to exactly `w` display columns (board/picker columns).
+fn cell(s: &str, w: usize) -> String {
+    let t = truncate_width(s, w);
+    let pad = w.saturating_sub(t.width());
+    format!("{t}{}", " ".repeat(pad))
+}
+
+/// The ●/○ running flash from the old sidebar — no colour change, just shape.
+fn flash_glyph(spinner: usize) -> &'static str {
+    if (spinner / 4) % 2 == 0 {
+        "●"
+    } else {
+        "○"
+    }
+}
+
+/// The working-line loader: five phase-shifted bars from cli-spinners'
+/// growVertical family — a rolling equalizer wave, coloured info → accent →
+/// accent2 across the bars.
+fn wave_spans(spin: usize) -> Vec<Span<'static>> {
+    const BARS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+    const TABLE: [usize; 14] = [0, 1, 2, 3, 4, 5, 6, 7, 6, 5, 4, 3, 2, 1];
+    let th = theme::get();
+    let cols = [th.info, th.accent, th.accent2, th.accent, th.info];
+    (0..5)
+        .map(|i| {
+            let lvl = TABLE[(spin + i * 2) % TABLE.len()];
+            Span::styled(BARS[lvl].to_string(), Style::default().fg(cols[i]))
+        })
+        .collect()
+}
+
+/// Status → (glyph, colour, meta word). Codex-simple: no cost on screen —
+/// that lives behind `:cost`.
+fn status_glyph(status: ChatStatus, running_secs: Option<u64>, spinner: usize) -> (&'static str, Color, String) {
+    let th = theme::get();
+    match status {
+        ChatStatus::Running => (
+            flash_glyph(spinner),
+            th.accent2,
+            fmt_secs(running_secs.unwrap_or(0)),
+        ),
+        ChatStatus::Error => ("✗", th.err, "error".into()),
+        ChatStatus::Idle => ("✓", th.ok, String::new()),
+        ChatStatus::New => ("○", th.dim, String::new()),
+    }
+}
+
+/// Longest-running chat's elapsed seconds, for a space's sidebar meta.
+fn space_running_secs(sp: &crate::app::Space) -> Option<u64> {
+    sp.chats
+        .iter()
+        .filter(|c| c.in_flight)
+        .filter_map(|c| c.turn_started.map(|t| t.elapsed().as_secs()))
+        .max()
+}
+
 pub fn render(f: &mut Frame, app: &mut App) {
     let area = f.area();
     let composer_h = composer_height(app, area.width.saturating_sub(4), area.height);
     let rows = Layout::vertical([
         Constraint::Length(1),          // header
         Constraint::Length(1),          // rule
-        Constraint::Min(3),             // transcript
+        Constraint::Min(3),             // body: [sidebar | transcript]
         Constraint::Length(1),          // lualine status
         Constraint::Length(composer_h), // prompt (flush to bottom, auto-grows)
     ])
@@ -94,7 +154,19 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
     render_header(f, rows[0], app);
     render_rule(f, rows[1]);
-    render_transcript(f, rows[2], app);
+
+    let side_w = if app.sidebar_open {
+        SIDEBAR_W.min(area.width.saturating_sub(24))
+    } else {
+        0
+    };
+    let cols =
+        Layout::horizontal([Constraint::Length(side_w), Constraint::Min(20)]).split(rows[2]);
+    if side_w > 0 {
+        render_sidebar(f, cols[0], app);
+    }
+    render_main(f, cols[1], app);
+
     render_status(f, rows[3], app);
     render_composer(f, rows[4], app);
 
@@ -102,41 +174,47 @@ pub fn render(f: &mut Frame, app: &mut App) {
         render_slash_popup(f, rows[4], app);
     }
 
-    if app.help_open {
-        render_help(f, area);
-    } else if app.mode == Mode::Confirm {
-        render_confirm(f, area, app);
-    } else if app.pending != Pending::None {
-        render_whichkey(f, area, app.pending);
+    match app.overlay {
+        Overlay::Help => render_help(f, area),
+        Overlay::Picker => render_picker(f, area, app),
+        Overlay::DirPicker => render_dir_picker(f, area, app),
+        Overlay::Board => render_board(f, area, app),
+        Overlay::DiffPad => render_diffpad(f, area, app),
+        Overlay::None => {
+            if app.mode == Mode::Confirm {
+                render_confirm(f, area, app);
+            }
+        }
     }
 }
 
+// Codex-simple header: name on the left, model dim on the right. Everything
+// else (permissions, session id, cost) lives behind :status / :cost.
 fn render_header(f: &mut Frame, area: Rect, app: &App) {
-    let sid = &app.chat.session_id[..8.min(app.chat.session_id.len())];
-    let perm = if app.dangerous { "dangerous" } else { "acceptEdits" };
-    let right_txt = format!("{} · {perm} · {sid} ", app.model_display);
+    let th = theme::get();
+    let right_txt = format!("{} ", app.model_display);
     let right_w = right_txt.width() as u16 + 1;
     let cols =
         Layout::horizontal([Constraint::Min(10), Constraint::Length(right_w)]).split(area);
 
-    let title = chat_title(&app.chat);
+    let title = space_name(app.space());
     let title_max = (cols[0].width as usize).saturating_sub(12);
     let left = Line::from(vec![
         Span::styled(
             " ✦ aeovim ".to_string(),
-            Style::default().fg(t::PURPLE).add_modifier(Modifier::BOLD),
+            Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
         ),
-        Span::styled("· ".to_string(), Style::default().fg(t::GUTTER)),
+        Span::styled("· ".to_string(), Style::default().fg(th.gutter)),
         Span::styled(
             truncate_width(&title, title_max.max(8)),
-            Style::default().fg(t::FG),
+            Style::default().fg(th.fg),
         ),
     ]);
     f.render_widget(Paragraph::new(left), cols[0]);
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             right_txt,
-            Style::default().fg(t::DIM),
+            Style::default().fg(th.dim),
         )))
         .right_aligned(),
         cols[1],
@@ -144,14 +222,215 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_rule(f: &mut Frame, area: Rect) {
+    let th = theme::get();
     let line: String = "─".repeat(area.width as usize);
     f.render_widget(
-        Paragraph::new(Line::from(Span::styled(line, Style::default().fg(t::GUTTER)))),
+        Paragraph::new(Line::from(Span::styled(line, Style::default().fg(th.gutter)))),
         area,
     );
 }
 
-fn render_transcript(f: &mut Frame, rect: Rect, app: &mut App) {
+// ---- sidebar — the pane that came back ------------------------------------
+
+fn render_sidebar(f: &mut Frame, area: Rect, app: &App) {
+    let th = theme::get();
+    let focused = app.focus == Focus::Sidebar;
+    let border = if focused { th.accent } else { th.gutter };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border))
+        .title(Span::styled(
+            " SPACES ",
+            Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.height < 2 {
+        return;
+    }
+
+    let running = app.running_count();
+    let roll = if running > 0 {
+        format!(" {} spaces · {} busy", app.spaces.len(), running)
+    } else {
+        format!(" {} spaces", app.spaces.len())
+    };
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(Span::styled(roll, Style::default().fg(th.dim))));
+
+    let iw = inner.width as usize;
+    for (i, sp) in app.spaces.iter().enumerate() {
+        let is_active = i == app.active;
+        let is_cursor = focused && i == app.sidebar_cursor;
+        let renaming = app.mode == Mode::Rename && app.rename_target == i;
+
+        let marker = if is_active {
+            "▎"
+        } else if is_cursor {
+            "›"
+        } else {
+            " "
+        };
+        let num = match i {
+            0..=8 => ((b'1' + i as u8) as char).to_string(),
+            9 => "0".to_string(),
+            _ => " ".to_string(),
+        };
+        let (glyph, gcol, meta) =
+            status_glyph(sp.status(), space_running_secs(sp), app.spinner);
+
+        let row_bg = if is_active {
+            Some(th.sel)
+        } else if is_cursor {
+            Some(th.cursorline)
+        } else {
+            None
+        };
+        let mut name_st = Style::default().fg(if is_active { th.fg } else { th.fgdim });
+        if is_active || is_cursor {
+            name_st = name_st.add_modifier(Modifier::BOLD);
+        }
+        let mut name = if renaming {
+            format!("{}▌", app.rename_buf)
+        } else {
+            space_name(sp)
+        };
+        if renaming {
+            name_st = Style::default().fg(th.accent2).add_modifier(Modifier::BOLD);
+        }
+        // The pane count survives truncation — appended AFTER the name is cut.
+        let count = if !renaming && sp.chats.len() > 1 {
+            format!(" ({})", sp.chats.len())
+        } else {
+            String::new()
+        };
+        // marker(1)+sp + num(1)+sp + glyph(1)+sp = 6 cols; meta sits right.
+        let meta_w = meta.width();
+        let name_max = iw.saturating_sub(6 + meta_w + count.width() + 2);
+        name = truncate_width(&name, name_max.max(4));
+        name.push_str(&count);
+        let gap = iw
+            .saturating_sub(6 + name.width() + meta_w + 1)
+            .max(1);
+
+        let apply = |st: Style| match row_bg {
+            Some(bg) => st.bg(bg),
+            None => st,
+        };
+        let marker_col = if is_active { th.accent } else { th.accent2 };
+        let meta_col = match sp.status() {
+            ChatStatus::Running => th.info,
+            ChatStatus::Error => th.err,
+            _ => th.dim,
+        };
+        lines.push(Line::from(vec![
+            Span::styled(marker.to_string(), apply(Style::default().fg(marker_col))),
+            Span::styled(format!("{num} "), apply(Style::default().fg(th.num))),
+            Span::styled(format!("{glyph} "), apply(Style::default().fg(gcol))),
+            Span::styled(name, apply(name_st)),
+            Span::styled(" ".repeat(gap), apply(Style::default())),
+            Span::styled(meta, apply(Style::default().fg(meta_col))),
+            Span::styled(" ".to_string(), apply(Style::default())),
+        ]));
+    }
+
+    let list_h = inner.height.saturating_sub(2);
+    let list = Rect { height: list_h, ..inner };
+    f.render_widget(Paragraph::new(lines), list);
+
+    // bottom hints — kept to two quiet lines
+    let hints = Rect {
+        y: inner.y + inner.height - 2,
+        height: 2,
+        ..inner
+    };
+    let hint_st = Style::default().fg(th.dim);
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(" Space ee · Space 1-0 · ga", hint_st)),
+            Line::from(Span::styled(" n new · d delete · r name", hint_st)),
+        ]),
+        hints,
+    );
+}
+
+// ---- main region: one chat, or a two-pane thin-divider vsplit --------------
+
+fn render_main(f: &mut Frame, rect: Rect, app: &mut App) {
+    let spin = app.spinner;
+    let active = app.active;
+    let n = app.spaces[active].chats.len();
+    if n <= 1 {
+        let chat = &mut app.spaces[active].chats[0];
+        render_transcript(f, rect, chat, spin);
+        return;
+    }
+
+    // Two panes with a one-column divider; each pane gets a slim header line.
+    let th = theme::get();
+    let pane_w = rect.width.saturating_sub(1) / 2;
+    let rects = [
+        Rect { width: pane_w, ..rect },
+        Rect {
+            x: rect.x + pane_w + 1,
+            width: rect.width.saturating_sub(pane_w + 1),
+            ..rect
+        },
+    ];
+    let divider = Rect {
+        x: rect.x + pane_w,
+        width: 1,
+        ..rect
+    };
+    let div_lines: Vec<Line> = (0..rect.height)
+        .map(|_| Line::from(Span::styled("│", Style::default().fg(th.gutter))))
+        .collect();
+    f.render_widget(Paragraph::new(div_lines), divider);
+
+    let focused_pane = app.spaces[active].focused.min(n - 1);
+    let main_focus = app.focus == Focus::Main;
+    for (ci, prect) in rects.iter().enumerate() {
+        if prect.width < 8 || prect.height < 2 {
+            continue;
+        }
+        let is_focused = main_focus && ci == focused_pane;
+        // pane header: `▎ chat N` + status glyph
+        let (hst, bar) = if is_focused {
+            (
+                Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+                th.accent,
+            )
+        } else {
+            (Style::default().fg(th.dim), th.gutter)
+        };
+        let status = app.spaces[active].chats[ci].status();
+        let secs = app.spaces[active].chats[ci]
+            .turn_started
+            .map(|t| t.elapsed().as_secs());
+        let (glyph, gcol, _) = status_glyph(status, secs, spin);
+        let header = Rect { height: 1, ..*prect };
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("▎", Style::default().fg(bar)),
+                Span::styled(format!(" chat {} ", ci + 1), hst),
+                Span::styled(glyph.to_string(), Style::default().fg(gcol)),
+            ])),
+            header,
+        );
+        let body = Rect {
+            y: prect.y + 1,
+            height: prect.height - 1,
+            ..*prect
+        };
+        let chat = &mut app.spaces[active].chats[ci];
+        render_transcript(f, body, chat, spin);
+    }
+}
+
+// ---- transcript ------------------------------------------------------------
+
+fn render_transcript(f: &mut Frame, rect: Rect, chat: &mut Chat, spin: usize) {
     // One column of breathing room each side; content never touches the edge.
     let body = Rect {
         x: rect.x + 1,
@@ -159,18 +438,15 @@ fn render_transcript(f: &mut Frame, rect: Rect, app: &mut App) {
         width: rect.width.saturating_sub(2),
         height: rect.height,
     };
-    let chat = &app.chat;
     if chat.transcript.is_empty() && chat.streaming.is_none() && !chat.in_flight {
         render_welcome(f, body);
         // keep the cache/scroll state consistent even on the welcome screen
-        app.chat.last_max_scroll = 0;
+        chat.last_max_scroll = 0;
         return;
     }
 
-    let spin = app.spinner;
     let width = body.width.max(1);
     let h = (body.height as usize).max(1);
-    let chat = &mut app.chat;
 
     // Settled transcript: served pre-wrapped from the cache; rebuilt only when
     // the transcript, the width, or the fold toggle changed.
@@ -220,6 +496,7 @@ fn render_transcript(f: &mut Frame, rect: Rect, app: &mut App) {
 
     // Scroll position hint when detached from the tail.
     if !chat.follow && max_scroll > 0 {
+        let th = theme::get();
         let pct = (scroll * 100 / max_scroll.max(1)).min(99);
         let tag = format!(" ↕ {pct}% · G bottom ");
         let w = tag.width() as u16;
@@ -233,7 +510,7 @@ fn render_transcript(f: &mut Frame, rect: Rect, app: &mut App) {
             f.render_widget(
                 Paragraph::new(Line::from(Span::styled(
                     tag,
-                    Style::default().fg(t::DIM),
+                    Style::default().fg(th.dim),
                 ))),
                 r,
             );
@@ -242,14 +519,15 @@ fn render_transcript(f: &mut Frame, rect: Rect, app: &mut App) {
 }
 
 fn render_welcome(f: &mut Frame, area: Rect) {
+    let th = theme::get();
+    let bold = |c| Style::default().fg(c).add_modifier(Modifier::BOLD);
     let lines: Vec<(&str, Style)> = vec![
-        ("✦ aeovim", Style::default().fg(t::PURPLE).add_modifier(Modifier::BOLD)),
+        ("✦ aeovim", bold(th.accent)),
         ("", Style::default()),
-        ("one conversation · claude code underneath", Style::default().fg(t::DIM)),
+        ("spaces on the left · claude code underneath", Style::default().fg(th.dim)),
         ("", Style::default()),
-        ("just type — Enter sends, Shift-Enter is a newline", Style::default().fg(t::FG)),
-        ("/  commands   ·   Esc  scroll mode   ·   ?  keys", Style::default().fg(t::DIM)),
-        ("Esc interrupts a running turn · za expands tool output", Style::default().fg(t::DIM)),
+        ("just type — Enter sends · Esc for vim", Style::default().fg(th.fg)),
+        ("? keys", Style::default().fg(th.dim)),
     ];
     let top = area.y + area.height.saturating_sub(lines.len() as u16) / 2;
     for (i, (txt, st)) in lines.iter().enumerate() {
@@ -266,12 +544,13 @@ fn render_welcome(f: &mut Frame, area: Rect) {
 
 /// Logical (unwrapped) lines for every settled transcript entry.
 fn build_transcript_lines(chat: &Chat) -> Vec<Line<'static>> {
-    let user_lbl = Style::default().fg(t::PERI).add_modifier(Modifier::BOLD);
-    let asst_lbl = Style::default().fg(t::PURPLE).add_modifier(Modifier::BOLD);
-    let tool_st = Style::default().fg(t::AMBER);
-    let note_st = Style::default().fg(t::DIM);
-    let err_st = Style::default().fg(t::RED).add_modifier(Modifier::BOLD);
-    let body = Style::default().fg(t::FG);
+    let th = theme::get();
+    let user_lbl = Style::default().fg(th.info).add_modifier(Modifier::BOLD);
+    let asst_lbl = Style::default().fg(th.accent).add_modifier(Modifier::BOLD);
+    let tool_st = Style::default().fg(th.warn);
+    let note_st = Style::default().fg(th.dim);
+    let err_st = Style::default().fg(th.err).add_modifier(Modifier::BOLD);
+    let body = Style::default().fg(th.fg);
 
     let mut out: Vec<Line> = Vec::new();
     for (i, e) in chat.transcript.iter().enumerate() {
@@ -285,8 +564,8 @@ fn build_transcript_lines(chat: &Chat) -> Vec<Line<'static>> {
             }
         }
         match e {
-            Entry::User(x) => push_block(&mut out, "❯ you", user_lbl, x, body),
-            Entry::Assistant(x) => push_block(&mut out, "✦ claude", asst_lbl, x, body),
+            Entry::User(x) => push_block(&mut out, "▎ you", user_lbl, x, body),
+            Entry::Assistant(x) => push_block(&mut out, "▎ claude", asst_lbl, x, body),
             Entry::Tool(x) => {
                 for (j, l) in x.split('\n').enumerate() {
                     let l = crate::app::clean_line(l);
@@ -299,7 +578,7 @@ fn build_transcript_lines(chat: &Chat) -> Vec<Line<'static>> {
                         let prefix = if j == 1 { "  ⎿  " } else { "     " };
                         out.push(Line::from(Span::styled(
                             format!("{prefix}{l}"),
-                            Style::default().fg(t::DIM),
+                            Style::default().fg(th.dim),
                         )));
                     }
                 }
@@ -311,14 +590,14 @@ fn build_transcript_lines(chat: &Chat) -> Vec<Line<'static>> {
                 // ⎿ summary, then the colored +/- hunk aligned under it.
                 out.push(Line::from(Span::styled(
                     format!("  ⎿  +{added} -{removed}"),
-                    Style::default().fg(t::GUTTER),
+                    Style::default().fg(th.gutter),
                 )));
                 for dl in lines {
                     let (marker, col) = match dl.kind {
-                        DiffKind::Add => ("+ ", t::GREEN),
-                        DiffKind::Del => ("- ", t::RED),
-                        DiffKind::Gap => ("  ", t::GUTTER),
-                        DiffKind::Ctx => ("  ", t::DIM),
+                        DiffKind::Add => ("+ ", th.ok),
+                        DiffKind::Del => ("- ", th.err),
+                        DiffKind::Gap => ("  ", th.gutter),
+                        DiffKind::Ctx => ("  ", th.dim),
                     };
                     out.push(Line::from(Span::styled(
                         format!("     {marker}{}", dl.text),
@@ -334,16 +613,17 @@ fn build_transcript_lines(chat: &Chat) -> Vec<Line<'static>> {
                     )));
                 }
             }
-            Entry::Error(x) => push_block(&mut out, "✗ error", err_st, x, err_st),
+            Entry::Error(x) => push_block(&mut out, "▎ ✗ error", err_st, x, err_st),
         }
     }
     out
 }
 
-/// A tool result: one summary line collapsed (za expands), full text expanded.
+/// A tool result: one summary line collapsed (Ctrl-t expands), full text expanded.
 /// The full text is stored either way — collapsing is a view, not a data loss.
 fn push_tool_result(out: &mut Vec<Line<'static>>, ok: bool, text: &str, expand: bool) {
-    let col = if ok { t::GUTTER } else { t::RED };
+    let th = theme::get();
+    let col = if ok { th.gutter } else { th.err };
     let lines: Vec<&str> = text.lines().collect();
     if !expand {
         let first = lines
@@ -354,7 +634,7 @@ fn push_tool_result(out: &mut Vec<Line<'static>>, ok: bool, text: &str, expand: 
         let mut summary = truncate_width(&crate::app::clean_line(first), 72);
         let extra = lines.len().saturating_sub(1);
         if extra > 0 {
-            summary.push_str(&format!("  (+{extra} lines · za expands)"));
+            summary.push_str(&format!("  (+{extra} lines · Ctrl-t expands)"));
         }
         if !summary.is_empty() {
             out.push(Line::from(Span::styled(
@@ -381,36 +661,40 @@ fn push_tool_result(out: &mut Vec<Line<'static>>, ok: bool, text: &str, expand: 
 
 /// The live tail: streaming text (fence-aware), the working line, queued prompts.
 fn build_tail_lines(chat: &Chat, spin: usize) -> Vec<Line<'static>> {
-    let asst_lbl = Style::default().fg(t::PURPLE).add_modifier(Modifier::BOLD);
-    let note_st = Style::default().fg(t::DIM);
-    let body = Style::default().fg(t::FG);
+    let th = theme::get();
+    let asst_lbl = Style::default().fg(th.accent).add_modifier(Modifier::BOLD);
+    let note_st = Style::default().fg(th.dim);
+    let body = Style::default().fg(th.fg);
     let mut out: Vec<Line> = Vec::new();
 
     if let Some(s) = &chat.streaming {
         if !chat.transcript.is_empty() {
             out.push(Line::from(""));
         }
-        out.push(Line::from(Span::styled("✦ claude", asst_lbl)));
+        out.push(Line::from(Span::styled("▎ claude", asst_lbl)));
         // Same fence-tracked renderer as settled text — streamed code used to
         // render mangled and then visibly rewrite itself once committed.
         push_body(&mut out, s, body);
         if let Some(last) = out.last_mut() {
             last.spans
-                .push(Span::styled("▌".to_string(), Style::default().fg(t::PINK)));
+                .push(Span::styled("▌".to_string(), Style::default().fg(th.accent2)));
         }
     } else if chat.in_flight {
         if !chat.transcript.is_empty() {
             out.push(Line::from(""));
         }
-        // Claude-Code-style working line: spinner · what's running · live seconds.
+        // Working line: rolling wave · what's running · live seconds.
         let secs = chat.turn_started.map(|s| s.elapsed().as_secs()).unwrap_or(0);
         let label = chat.activity.as_deref().unwrap_or("Working");
-        out.push(Line::from(vec![
-            Span::styled(format!("  {} ", SPIN[spin % SPIN.len()]), asst_lbl),
-            Span::styled(label.to_string(), body),
-            Span::styled(format!("  {}", fmt_secs(secs)), note_st),
-            Span::styled("   esc interrupt".to_string(), note_st),
-        ]));
+        let mut spans: Vec<Span> = vec![Span::styled("  ".to_string(), note_st)];
+        spans.extend(wave_spans(spin));
+        spans.push(Span::styled(
+            format!(" {label}"),
+            Style::default().fg(th.accent2),
+        ));
+        spans.push(Span::styled(format!("  {}", fmt_secs(secs)), note_st));
+        spans.push(Span::styled("   ctrl-c interrupt".to_string(), note_st));
+        out.push(Line::from(spans));
     }
 
     // Prompts queued while the turn runs — shown dimmed below the active work.
@@ -418,11 +702,11 @@ fn build_tail_lines(chat: &Chat, spin: usize) -> Vec<Line<'static>> {
         out.push(Line::from(""));
         for q in &chat.queue {
             out.push(Line::from(vec![
-                Span::styled("  ❯ ".to_string(), Style::default().fg(t::PINK)),
-                Span::styled(q.clone(), Style::default().fg(t::DIM)),
+                Span::styled("  ❯ ".to_string(), Style::default().fg(th.accent2)),
+                Span::styled(q.clone(), Style::default().fg(th.dim)),
                 Span::styled(
                     "  (queued)".to_string(),
-                    Style::default().fg(t::DIM).add_modifier(Modifier::ITALIC),
+                    Style::default().fg(th.dim).add_modifier(Modifier::ITALIC),
                 ),
             ]));
         }
@@ -557,11 +841,12 @@ fn is_word(c: Option<&char>) -> bool {
 /// Emphasis needs word boundaries — `foo_bar_baz` and `a * b * c` stay
 /// literal (the old pass ate the delimiters out of every snake_case name).
 fn md_spans(text: &str, base: Style) -> Vec<Span<'static>> {
+    let th = theme::get();
     let s: Vec<char> = text.chars().collect();
     let n = s.len();
     let mut out: Vec<Span> = Vec::new();
     let mut buf = String::new();
-    let code_st = Style::default().fg(t::PERI);
+    let code_st = Style::default().fg(th.info);
     let mut i = 0;
     while i < n {
         if s[i] == '`' {
@@ -620,6 +905,7 @@ fn md_spans(text: &str, base: Style) -> Vec<Span<'static>> {
 
 /// A transcript body line: indent prefix + markdown (headers rendered bold).
 fn md_line(prefix: &str, text: &str, base: Style) -> Line<'static> {
+    let th = theme::get();
     let cleaned = crate::app::clean_line(text);
     let text = cleaned.as_str();
     let trimmed = text.trim_start();
@@ -632,7 +918,7 @@ fn md_line(prefix: &str, text: &str, base: Style) -> Line<'static> {
             Span::styled(prefix.to_string(), base),
             Span::styled(
                 rest.to_string(),
-                Style::default().fg(t::PURPLE).add_modifier(Modifier::BOLD),
+                Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
             ),
         ]);
     }
@@ -642,17 +928,17 @@ fn md_line(prefix: &str, text: &str, base: Style) -> Line<'static> {
         .or_else(|| trimmed.strip_prefix("* "))
         .or_else(|| trimmed.strip_prefix("+ "));
     if let Some(rest) = bullet {
-        let mut spans = vec![Span::styled(format!("{prefix}• "), Style::default().fg(t::PERI))];
+        let mut spans = vec![Span::styled(format!("{prefix}• "), Style::default().fg(th.info))];
         spans.extend(md_spans(rest, base));
         return Line::from(spans);
     }
     // blockquote
     if let Some(rest) = trimmed.strip_prefix("> ") {
         return Line::from(vec![
-            Span::styled(format!("{prefix}▏ "), Style::default().fg(t::GUTTER)),
+            Span::styled(format!("{prefix}▏ "), Style::default().fg(th.gutter)),
             Span::styled(
                 rest.to_string(),
-                Style::default().fg(t::DIM).add_modifier(Modifier::ITALIC),
+                Style::default().fg(th.dim).add_modifier(Modifier::ITALIC),
             ),
         ]);
     }
@@ -664,6 +950,7 @@ fn md_line(prefix: &str, text: &str, base: Style) -> Line<'static> {
 /// Render message body text with ``` fence tracking — code inside fences gets a
 /// gutter bar and is never markdown-mangled. Shared by settled AND streaming.
 fn push_body(out: &mut Vec<Line<'static>>, text: &str, body: Style) {
+    let th = theme::get();
     let mut in_fence = false;
     for l in text.split('\n') {
         if l.trim_start().starts_with("```") {
@@ -674,13 +961,13 @@ fn push_body(out: &mut Vec<Line<'static>>, text: &str, body: Style) {
             } else {
                 "  ▏".to_string()
             };
-            out.push(Line::from(Span::styled(tag, Style::default().fg(t::GUTTER))));
+            out.push(Line::from(Span::styled(tag, Style::default().fg(th.gutter))));
             continue;
         }
         if in_fence {
             out.push(Line::from(vec![
-                Span::styled("  ▏ ".to_string(), Style::default().fg(t::GUTTER)),
-                Span::styled(crate::app::clean_line(l), Style::default().fg(t::PERI)),
+                Span::styled("  ▏ ".to_string(), Style::default().fg(th.gutter)),
+                Span::styled(crate::app::clean_line(l), Style::default().fg(th.info)),
             ]));
         } else {
             out.push(md_line("  ", l, body));
@@ -696,6 +983,7 @@ fn push_block(out: &mut Vec<Line<'static>>, label: &str, lbl: Style, text: &str,
 // ---- composer ------------------------------------------------------------
 
 fn render_slash_popup(f: &mut Frame, composer: Rect, app: &App) {
+    let th = theme::get();
     let area = f.area();
     let matches = app.slash_matches();
     // Clamp to the space above the composer — an unclamped rect used to panic
@@ -713,10 +1001,10 @@ fn render_slash_popup(f: &mut Frame, composer: Rect, app: &App) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(t::BORDER))
+        .border_style(Style::default().fg(th.border))
         .title(Span::styled(
             " commands — Tab completes ",
-            Style::default().fg(t::PURPLE).add_modifier(Modifier::BOLD),
+            Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(rect);
     f.render_widget(Clear, rect);
@@ -737,9 +1025,9 @@ fn render_slash_popup(f: &mut Frame, composer: Rect, app: &App) {
             let selected = i == app.slash_sel;
             let caret = if selected { "› " } else { "  " };
             let st = if selected {
-                Style::default().fg(t::PINK).add_modifier(Modifier::BOLD)
+                Style::default().fg(th.accent2).add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(t::FG)
+                Style::default().fg(th.fg)
             };
             Line::from(Span::styled(format!("{caret}/{cmd}"), st))
         })
@@ -752,8 +1040,8 @@ fn render_slash_popup(f: &mut Frame, composer: Rect, app: &App) {
 fn composer_edit(app: &App) -> Option<(&'static str, &str, usize)> {
     match app.mode {
         Mode::Insert => Some(("❯ ", app.input.as_str(), app.input_cursor)),
-        Mode::Command => Some((": ", app.cmd.as_str(), app.cmd.len())),
         Mode::Rename => Some(("rename ❯ ", app.rename_buf.as_str(), app.rename_buf.len())),
+        Mode::Command => Some((":", app.cmdline.as_str(), app.cmdline.len())),
         _ => None,
     }
 }
@@ -815,11 +1103,12 @@ fn composer_height(app: &App, inner_w: u16, screen_h: u16) -> u16 {
 }
 
 fn render_composer(f: &mut Frame, area: Rect, app: &App) {
+    let th = theme::get();
     let accent = match app.mode {
-        Mode::Insert => t::PINK,
-        Mode::Rename => t::PURPLE,
-        Mode::Command => t::AMBER,
-        _ => t::BORDER,
+        Mode::Insert => th.accent2,
+        Mode::Rename => th.accent,
+        Mode::Command => th.warn,
+        _ => th.gutter,
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -843,12 +1132,12 @@ fn render_composer(f: &mut Frame, area: Rect, app: &App) {
             if vi == 0 {
                 lines.push(Line::from(vec![
                     Span::styled(prefix.to_string(), Style::default().fg(accent)),
-                    Span::styled(r.clone(), Style::default().fg(t::FG)),
+                    Span::styled(r.clone(), Style::default().fg(th.fg)),
                 ]));
             } else {
                 lines.push(Line::from(Span::styled(
                     r.clone(),
-                    Style::default().fg(t::FG),
+                    Style::default().fg(th.fg),
                 )));
             }
         }
@@ -857,7 +1146,7 @@ fn render_composer(f: &mut Frame, area: Rect, app: &App) {
             if let Some(first) = lines.first_mut() {
                 first.spans.push(Span::styled(
                     "ask anything — / for commands".to_string(),
-                    Style::default().fg(t::GUTTER),
+                    Style::default().fg(th.gutter),
                 ));
             }
         }
@@ -869,98 +1158,488 @@ fn render_composer(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    // Normal mode: keep the drafted text visible (dimmed) or show the hints.
-    let line = if !app.input.is_empty() {
+    // Normal/Confirm: keep the drafted text visible dimmed, else the key hints.
+    let line = if app.input.is_empty() {
         Line::from(vec![
-            Span::styled("❯ ".to_string(), Style::default().fg(t::DIM)),
+            Span::styled("❯ ".to_string(), Style::default().fg(th.accent2)),
             Span::styled(
-                app.input.replace('\n', " ⏎ "),
-                Style::default().fg(t::DIM),
+                "i to compose · : commands · ? keys".to_string(),
+                Style::default().fg(th.gutter),
             ),
-            Span::styled("  (i to edit)".to_string(), Style::default().fg(t::GUTTER)),
         ])
     } else {
-        Line::from(Span::styled(
-            " i type · j/k scroll · za tools · r rename · ? keys · q quit",
-            Style::default().fg(t::DIM),
-        ))
+        Line::from(vec![
+            Span::styled("❯ ".to_string(), Style::default().fg(th.dim)),
+            Span::styled(app.input.replace('\n', " ⏎ "), Style::default().fg(th.dim)),
+            Span::styled("  — i to edit".to_string(), Style::default().fg(th.gutter)),
+        ])
     };
     f.render_widget(Paragraph::new(line), inner);
 }
 
-// lualine-style powerline statusline.
+// ---- lualine-style powerline statusline -----------------------------------
+
 fn render_status(f: &mut Frame, area: Rect, app: &App) {
+    let th = theme::get();
     let (label, mode_col) = match app.mode {
-        Mode::Normal => ("NORMAL", t::MODE_NORMAL),
-        Mode::Insert => ("INSERT", t::MODE_INSERT),
-        Mode::Command => ("COMMAND", t::MODE_COMMAND),
-        Mode::Rename => ("RENAME", t::MODE_VISUAL),
-        Mode::Confirm => ("CONFIRM", t::RED),
+        Mode::Normal => ("NORMAL", th.mode_normal),
+        Mode::Insert => ("INSERT", th.mode_insert),
+        Mode::Rename => ("RENAME", th.mode_visual),
+        Mode::Command => ("COMMAND", th.mode_command),
+        Mode::Confirm => ("CONFIRM", th.err),
     };
-    let c = &app.chat;
-    // A toast (bad command, corrupt state file, …) takes the info segment until
-    // the next keypress.
-    let info = match &app.toast {
+    // Codex-simple: just [ MODE ][ name ]. A toast takes the name segment
+    // until the next keypress; cost/model/permissions live in :cost / :status.
+    let seg1 = match &app.toast {
         Some(m) => format!(" {} ", truncate_width(m, 60)),
-        None => format!(" {} ", app.model_display),
+        None => format!(" {} ", truncate_width(&space_name(app.space()), 32)),
     };
-    let info_st = if app.toast.is_some() {
-        Style::default().fg(t::AMBER).bg(t::PANEL)
+    let seg1_st = if app.toast.is_some() {
+        Style::default().fg(th.warn).bg(th.panel)
     } else {
-        Style::default().fg(t::DIM).bg(t::PANEL)
+        Style::default().fg(th.fg).bg(th.panel)
     };
 
-    let cols = Layout::horizontal([Constraint::Min(1), Constraint::Length(20)]).split(area);
-
-    // left: [ mode ][ info ]
+    // No right-side loader — the transcript's working line already carries the
+    // wave + elapsed; the statusline stays quiet.
     let left = Line::from(vec![
         Span::styled(
             format!(" {label} "),
             Style::default()
-                .fg(t::PANEL)
+                .fg(th.panel)
                 .bg(mode_col)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(SEP_R, Style::default().fg(mode_col).bg(t::PANEL)),
-        Span::styled(info, info_st),
-        Span::styled(SEP_R, Style::default().fg(t::PANEL)),
+        Span::styled(SEP_R, Style::default().fg(mode_col).bg(th.panel)),
+        Span::styled(seg1, seg1_st),
+        Span::styled(SEP_R, Style::default().fg(th.panel)),
     ]);
-    f.render_widget(Paragraph::new(left), cols[0]);
+    f.render_widget(Paragraph::new(left), area);
+}
 
-    // right: turn state + running cost (only once it rounds to a visible cent).
-    let cost = if c.cost >= 0.005 {
-        format!("${:.2} ", c.cost)
-    } else {
-        String::new()
+// ---- overlays --------------------------------------------------------------
+
+/// `ga` — fuzzy space picker (GO TO SPACE).
+fn render_picker(f: &mut Frame, area: Rect, app: &App) {
+    let th = theme::get();
+    let matches = app.picker_matches();
+    let shown = matches.len().clamp(1, 8) as u16;
+    let w = 72u16.min(area.width.saturating_sub(4));
+    let h = (shown + 4).min(area.height.saturating_sub(2));
+    let mut rect = centered(area, w, h);
+    rect.y = (area.y + area.height / 5).min(rect.y);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(th.border))
+        .title(Span::styled(
+            " GO TO SPACE ",
+            Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(rect);
+    f.render_widget(Clear, rect);
+    f.render_widget(block, rect);
+    if inner.height < 2 {
+        return;
+    }
+
+    let count = format!("{}/{}", matches.len(), app.spaces.len());
+    let qpad = (inner.width as usize)
+        .saturating_sub(2 + app.picker_query.width() + 1 + count.width() + 1);
+    let query = Line::from(vec![
+        Span::styled("❯ ".to_string(), Style::default().fg(th.accent2).add_modifier(Modifier::BOLD)),
+        Span::styled(app.picker_query.clone(), Style::default().fg(th.fg)),
+        Span::styled("▌".to_string(), Style::default().fg(th.accent2)),
+        Span::styled(" ".repeat(qpad.max(1)), Style::default()),
+        Span::styled(count, Style::default().fg(th.dim)),
+    ]);
+    f.render_widget(query, Rect { height: 1, ..inner });
+
+    let sel = app.picker_sel.min(matches.len().saturating_sub(1));
+    let list = Rect {
+        y: inner.y + 1,
+        height: inner.height - 1,
+        ..inner
     };
-    let right = if c.in_flight {
-        let secs = c.turn_started.map(|s| s.elapsed().as_secs()).unwrap_or(0);
-        let dot = if c.interrupting { "⎋ " } else { "● " };
-        Line::from(vec![
-            Span::styled(dot, Style::default().fg(t::AMBER)),
-            Span::styled(format!("{} ", fmt_secs(secs)), Style::default().fg(t::FG)),
-            Span::styled(cost, Style::default().fg(t::DIM)),
-        ])
-    } else {
-        Line::from(vec![
-            Span::styled("idle ", Style::default().fg(t::DIM)),
-            Span::styled(cost, Style::default().fg(t::DIM)),
-        ])
+    let win = list.height as usize;
+    let start = if sel >= win { sel + 1 - win } else { 0 };
+    let mut lines: Vec<Line> = Vec::new();
+    for (row, (idx, pos)) in matches.iter().enumerate().skip(start).take(win) {
+        let sp = &app.spaces[*idx];
+        let selected = row == sel;
+        let row_bg = if selected { Some(th.sel) } else { None };
+        let apply = |st: Style| match row_bg {
+            Some(bg) => st.bg(bg),
+            None => st,
+        };
+        let caret = if selected { "› " } else { "  " };
+        let num = match *idx {
+            0..=8 => ((b'1' + *idx as u8) as char).to_string(),
+            9 => "0".to_string(),
+            _ => " ".to_string(),
+        };
+        let (glyph, gcol, meta) =
+            status_glyph(sp.status(), space_running_secs(sp), app.spinner);
+
+        let mut spans: Vec<Span> = vec![
+            Span::styled(caret.to_string(), apply(Style::default().fg(th.accent2))),
+            Span::styled(format!("{num} "), apply(Style::default().fg(th.num))),
+            Span::styled(format!("{glyph} "), apply(Style::default().fg(gcol))),
+        ];
+        // name with matched chars highlighted (fuzzy hits in accent2 bold)
+        let title = truncate_width(&space_name(sp), (inner.width as usize).saturating_sub(24));
+        let plain = apply(Style::default().fg(if selected { th.fg } else { th.fgdim }));
+        let hit = apply(
+            Style::default()
+                .fg(th.accent2)
+                .add_modifier(Modifier::BOLD),
+        );
+        let mut buf = String::new();
+        let mut buf_hit = false;
+        for (ci, ch) in title.chars().enumerate() {
+            let is_hit = pos.contains(&ci);
+            if is_hit != buf_hit && !buf.is_empty() {
+                spans.push(Span::styled(
+                    std::mem::take(&mut buf),
+                    if buf_hit { hit } else { plain },
+                ));
+            }
+            buf_hit = is_hit;
+            buf.push(ch);
+        }
+        if !buf.is_empty() {
+            spans.push(Span::styled(buf, if buf_hit { hit } else { plain }));
+        }
+        // status word on the right edge
+        let used: usize = spans.iter().map(|s| s.content.width()).sum();
+        let gap = (inner.width as usize).saturating_sub(used + meta.width() + 1);
+        spans.push(Span::styled(" ".repeat(gap.max(1)), apply(Style::default())));
+        spans.push(Span::styled(meta, apply(Style::default().fg(th.dim))));
+        lines.push(Line::from(spans));
+    }
+    f.render_widget(Paragraph::new(lines), list);
+}
+
+/// `gd` / bare `:cd` — fuzzy directory picker rooted at $HOME. Same shape as
+/// the space picker so the two feel like one control; the current dir of the
+/// space is shown in the title, since that's what you're about to change.
+fn render_dir_picker(f: &mut Frame, area: Rect, app: &App) {
+    let th = theme::get();
+    let matches = app.dir_matches();
+    let shown = matches.len().clamp(1, 12) as u16;
+    let w = 78u16.min(area.width.saturating_sub(4));
+    let h = (shown + 4).min(area.height.saturating_sub(2));
+    let mut rect = centered(area, w, h);
+    rect.y = (area.y + area.height / 6).min(rect.y);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(th.border))
+        .title(Span::styled(
+            format!(" OPEN DIR — now in {} ", crate::app::tilde(&app.space().dir)),
+            Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(rect);
+    f.render_widget(Clear, rect);
+    f.render_widget(block, rect);
+    if inner.height < 2 {
+        return;
+    }
+
+    let count = format!("{}/{}", matches.len(), app.dir_candidates.len());
+    let qpad = (inner.width as usize)
+        .saturating_sub(2 + app.dir_query.width() + 1 + count.width() + 1);
+    let query = Line::from(vec![
+        Span::styled(
+            "❯ ".to_string(),
+            Style::default().fg(th.accent2).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(app.dir_query.clone(), Style::default().fg(th.fg)),
+        Span::styled("▌".to_string(), Style::default().fg(th.accent2)),
+        Span::styled(" ".repeat(qpad.max(1)), Style::default()),
+        Span::styled(count, Style::default().fg(th.dim)),
+    ]);
+    f.render_widget(query, Rect { height: 1, ..inner });
+
+    let sel = app.dir_sel.min(matches.len().saturating_sub(1));
+    let list = Rect { y: inner.y + 1, height: inner.height - 1, ..inner };
+    let win = list.height as usize;
+    let start = if sel >= win { sel + 1 - win } else { 0 };
+    let mut lines: Vec<Line> = Vec::new();
+    for (row, (idx, pos)) in matches.iter().enumerate().skip(start).take(win) {
+        let selected = row == sel;
+        let row_bg = if selected { Some(th.sel) } else { None };
+        let apply = |st: Style| match row_bg {
+            Some(bg) => st.bg(bg),
+            None => st,
+        };
+        let caret = if selected { "› " } else { "  " };
+        let mut spans: Vec<Span> = vec![Span::styled(
+            caret.to_string(),
+            apply(Style::default().fg(th.accent2)),
+        )];
+        let path = crate::app::tilde(&app.dir_candidates[*idx]);
+        let path = truncate_width(&path, (inner.width as usize).saturating_sub(4));
+        let plain = apply(Style::default().fg(if selected { th.fg } else { th.fgdim }));
+        let hit = apply(Style::default().fg(th.accent2).add_modifier(Modifier::BOLD));
+        let mut buf = String::new();
+        let mut buf_hit = false;
+        for (ci, ch) in path.chars().enumerate() {
+            let is_hit = pos.contains(&ci);
+            if is_hit != buf_hit && !buf.is_empty() {
+                spans.push(Span::styled(
+                    std::mem::take(&mut buf),
+                    if buf_hit { hit } else { plain },
+                ));
+            }
+            buf_hit = is_hit;
+            buf.push(ch);
+        }
+        if !buf.is_empty() {
+            spans.push(Span::styled(buf, if buf_hit { hit } else { plain }));
+        }
+        lines.push(Line::from(spans));
+    }
+    f.render_widget(Paragraph::new(lines), list);
+}
+
+/// `:tasks` — one row per chat (kept simple: space, state, elapsed, last).
+fn render_board(f: &mut Frame, area: Rect, app: &App) {
+    let th = theme::get();
+    let rows = app.board_rows();
+    let w = 92u16.min(area.width.saturating_sub(4));
+    let h = (rows.len() as u16 + 5).min(area.height.saturating_sub(2));
+    let rect = centered(area, w, h);
+    let title = format!(" TASKS — {} busy · {} spaces ", app.running_count(), app.spaces.len());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(th.border))
+        .title(Span::styled(
+            title,
+            Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(rect);
+    f.render_widget(Clear, rect);
+    f.render_widget(block, rect);
+    if inner.height < 3 {
+        return;
+    }
+
+    let name_w = 26usize.min((inner.width as usize).saturating_sub(34)).max(10);
+    let head_st = Style::default().fg(th.dim);
+    let mut lines: Vec<Line> = vec![Line::from(Span::styled(
+        format!(
+            " {}{}{}{}last",
+            cell("#", 4),
+            cell("space", name_w + 2),
+            cell("state", 12),
+            cell("elapsed", 9),
+        ),
+        head_st,
+    ))];
+
+    for (row, (si, ci)) in rows.iter().enumerate() {
+        let sp = &app.spaces[*si];
+        let c = &sp.chats[*ci];
+        let selected = row == app.board_sel;
+        let row_bg = if selected { Some(th.sel) } else { None };
+        let apply = |st: Style| match row_bg {
+            Some(bg) => st.bg(bg),
+            None => st,
+        };
+        let (state, scol) = match c.status() {
+            ChatStatus::Running => (
+                format!("{} running", SPIN[app.spinner % SPIN.len()]),
+                th.accent,
+            ),
+            ChatStatus::Error => ("✗ error".to_string(), th.err),
+            ChatStatus::Idle => ("✓ idle".to_string(), th.ok),
+            ChatStatus::New => ("· new".to_string(), th.dim),
+        };
+        let elapsed = match (c.in_flight, c.turn_started) {
+            (true, Some(t)) => fmt_secs(t.elapsed().as_secs()),
+            _ => "—".to_string(),
+        };
+        // last line: what's running now, else the last transcript line.
+        let last = if let Some(a) = &c.activity {
+            a.clone()
+        } else {
+            c.transcript
+                .iter()
+                .rev()
+                .find_map(|e| match e {
+                    Entry::Assistant(x) | Entry::User(x) | Entry::Note(x) | Entry::Error(x) => {
+                        x.lines().next().map(|l| l.to_string())
+                    }
+                    _ => None,
+                })
+                .unwrap_or_default()
+        };
+        let name = if sp.chats.len() > 1 {
+            format!("{} · {}", space_name(sp), ci + 1)
+        } else {
+            space_name(sp)
+        };
+        let last_max = (inner.width as usize).saturating_sub(4 + name_w + 2 + 12 + 9 + 2);
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" {}", cell(&format!("{}", si + 1), 4)),
+                apply(Style::default().fg(th.num)),
+            ),
+            Span::styled(
+                cell(&name, name_w + 2),
+                apply(Style::default().fg(if selected { th.fg } else { th.fgdim })),
+            ),
+            Span::styled(cell(&state, 12), apply(Style::default().fg(scol))),
+            Span::styled(cell(&elapsed, 9), apply(Style::default().fg(th.dim))),
+            Span::styled(
+                truncate_width(&crate::app::clean_line(&last), last_max.max(4)),
+                apply(Style::default().fg(th.dim)),
+            ),
+        ]));
+    }
+    let list = Rect {
+        height: inner.height.saturating_sub(1),
+        ..inner
     };
-    f.render_widget(Paragraph::new(right).right_aligned(), cols[1]);
+    f.render_widget(Paragraph::new(lines), list);
+
+    let foot = Rect {
+        y: inner.y + inner.height - 1,
+        height: 1,
+        ..inner
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " ⏎ focus · x cancel turn · esc close",
+            Style::default().fg(th.dim),
+        ))),
+        foot,
+    );
+}
+
+/// `:diff` — a quick pad over the focused chat's edit history. j/k scroll the
+/// hunk; Ctrl-j/Ctrl-k step to the older / newer diff.
+fn render_diffpad(f: &mut Frame, area: Rect, app: &mut App) {
+    let th = theme::get();
+    // Cheap: rebuilds only when the chat changed since the last build.
+    app.sync_diff_doc();
+    if app.diff_rows.is_empty() {
+        app.overlay = Overlay::None;
+        return;
+    }
+    let doc = &app.diff_rows;
+    let starts = &app.diff_starts;
+
+    let w = area.width.saturating_sub(8).clamp(40, 110);
+    let h = area.height.saturating_sub(4).max(8);
+    let rect = centered(area, w, h);
+
+    let inner_h = h.saturating_sub(2) as usize; // block borders
+    let body_h = inner_h.saturating_sub(1); // footer row
+    let max_scroll = doc.len().saturating_sub(body_h.max(1));
+    app.diff_scroll = app.diff_scroll.min(max_scroll);
+    let scroll = app.diff_scroll;
+
+    // The header names whatever row is at the TOP of the viewport, so
+    // scrolling from one file's hunk into the next renames it in place.
+    let head = &doc[scroll.min(doc.len() - 1)];
+    let which = starts.iter().filter(|&&s| s <= scroll).count().max(1);
+    let title = format!(
+        " DIFF · {} · +{} −{} · file {}/{} ",
+        head.file,
+        head.added,
+        head.removed,
+        which,
+        starts.len()
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(th.border))
+        .title(Span::styled(
+            truncate_width(&title, w as usize - 2),
+            Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(rect);
+    f.render_widget(Clear, rect);
+    f.render_widget(block, rect);
+    if inner.height < 2 {
+        return;
+    }
+
+    let mut out: Vec<Line> = Vec::with_capacity(body_h);
+    for row in doc.iter().skip(scroll).take(body_h) {
+        match &row.line {
+            // File separator: the boundary you scroll across, spelled out in
+            // the body too so it's obvious why the header just changed.
+            None => out.push(Line::from(vec![
+                Span::styled(
+                    format!(" ▌ {} ", row.file),
+                    Style::default()
+                        .fg(th.accent)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("+{} −{}", row.added, row.removed),
+                    Style::default().fg(th.dim),
+                ),
+            ])),
+            Some(dl) => {
+                let (marker, col) = match dl.kind {
+                    DiffKind::Add => ("+ ", th.ok),
+                    DiffKind::Del => ("- ", th.err),
+                    DiffKind::Gap => ("  ", th.gutter),
+                    DiffKind::Ctx => ("  ", th.dim),
+                };
+                out.push(Line::from(Span::styled(
+                    format!(" {marker}{}", dl.text),
+                    Style::default().fg(col),
+                )));
+            }
+        }
+    }
+    let body = Rect {
+        height: inner.height - 1,
+        ..inner
+    };
+    f.render_widget(Paragraph::new(out), body);
+
+    let foot = Rect {
+        y: inner.y + inner.height - 1,
+        height: 1,
+        ..inner
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            &if app.diff_elided > 0 {
+                // Never let the cap hide work silently.
+                format!(
+                    " j/k scroll · ⌃j/⌃k jump file · g/G top/end · esc close · {} older file(s) not shown",
+                    app.diff_elided
+                )
+            } else {
+                " j/k scroll · ⌃j/⌃k jump file · g/G top/end · esc close".to_string()
+            },
+            Style::default().fg(th.dim),
+        ))),
+        foot,
+    );
 }
 
 fn render_confirm(f: &mut Frame, area: Rect, app: &App) {
+    let th = theme::get();
     let msg = app.confirm_msg.clone();
     let w = (msg.width() as u16 + 6).clamp(24, area.width.saturating_sub(4).max(24));
     let rect = centered(area, w, 3);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(t::RED))
+        .border_style(Style::default().fg(th.err))
         .title(Span::styled(
             " confirm ",
-            Style::default().fg(t::RED).add_modifier(Modifier::BOLD),
+            Style::default().fg(th.err).add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(rect);
     f.render_widget(Clear, rect);
@@ -968,97 +1647,48 @@ fn render_confirm(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             format!(" {msg}"),
-            Style::default().fg(t::FG),
+            Style::default().fg(th.fg),
         ))),
         inner,
     );
 }
 
-fn render_whichkey(f: &mut Frame, area: Rect, pending: Pending) {
-    let (title, entries): (&str, Vec<(&str, &str)>) = match pending {
-        Pending::Leader => (
-            "leader",
-            vec![("z", "help / all keybinds"), ("e", "expand/collapse tools")],
-        ),
-        Pending::G => ("g", vec![("g", "top of transcript")]),
-        Pending::Z => (
-            "z",
-            vec![("z", "jump to newest"), ("a", "expand/collapse tool output")],
-        ),
-        Pending::None => return,
-    };
-
-    let w = 38u16.min(area.width);
-    let h = (entries.len() as u16 + 2).min(area.height);
-    let rect = Rect {
-        x: area.x + area.width.saturating_sub(w),
-        y: area.y + area.height.saturating_sub(h + 1).min(area.height.saturating_sub(h)),
-        width: w,
-        height: h,
-    };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(t::BORDER))
-        .title(Span::styled(
-            format!(" {title} "),
-            Style::default().fg(t::PURPLE).add_modifier(Modifier::BOLD),
-        ));
-    let inner = block.inner(rect);
-    f.render_widget(Clear, rect);
-    f.render_widget(block, rect);
-    let lines: Vec<Line> = entries
-        .iter()
-        .map(|(k, d)| {
-            Line::from(vec![
-                Span::styled(
-                    format!(" {k:>3} "),
-                    Style::default().fg(t::PINK).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("→ ", Style::default().fg(t::GUTTER)),
-                Span::styled(d.to_string(), Style::default().fg(t::FG)),
-            ])
-        })
-        .collect();
-    f.render_widget(Paragraph::new(lines), inner);
-}
-
 fn render_help(f: &mut Frame, area: Rect) {
+    let th = theme::get();
     let rows: &[(&str, &str)] = &[
-        ("", "TALK"),
-        ("type + Enter", "send (stays in Insert; launch starts here)"),
-        ("Shift/Alt-Enter", "newline · Ctrl-j same"),
+        ("", "MODES — Esc is Normal · i is Insert"),
+        ("i / a / o", "compose (o = new line) · Enter sends, stays Insert"),
+        ("Esc", "Insert → Normal · in Normal: snap to tail"),
+        (":", ":q :vs :new :clear :diff :tasks :rename :cost :status :N"),
         ("/", "slash commands — Tab completes, Enter sends"),
-        ("/clear · :clear", "wipe transcript, fresh session"),
+        ("", "SPACES (sidebar) — a space holds 1–2 chats"),
+        ("Space ee", "toggle sidebar · Space ef / Ctrl-h focus it"),
+        ("Space 1-0", "jump to space N · gt / gT cycle · ga fuzzy"),
+        ("Space n · Space t", "new space · tasks"),
+        ("j k ⏎ n d r", "in sidebar: move · open · new · delete · rename"),
+        ("", "SPLITS"),
+        (":vs · Ctrl-w v", "second chat pane in this space"),
+        ("Ctrl-h/l · Ctrl-w w", "move between panes (and the sidebar)"),
+        (":q · Ctrl-w q", "close pane — then the space"),
+        ("", "REVIEW"),
+        (":diff", "diff pad · j/k scroll · ⌃j older · ⌃k newer"),
+        ("Ctrl-t", "expand / collapse tool output"),
         ("", "STEER"),
-        ("Esc / Ctrl-c", "interrupt the running turn (again = force)"),
+        ("Ctrl-c", "interrupt (again = force) · idle: quit (asks)"),
         ("(while busy)", "keep typing — sends queue up in order"),
-        ("", "READ (Esc → Normal)"),
-        ("j / k", "scroll · Ctrl-d/u half page · PgUp/PgDn"),
-        ("gg / G", "top / bottom (follow the stream)"),
-        ("za", "expand / collapse tool output"),
-        ("zz", "jump back to the newest activity"),
-        ("", "COMPOSER"),
-        ("←→↑↓ Home End", "move cursor · Ctrl-a/e line ends"),
-        ("Ctrl-w / Ctrl-u", "delete word / clear"),
-        ("paste", "Cmd-V multi-line intact · Ctrl-v = pbpaste"),
-        ("", "MISC"),
-        ("r", "rename conversation (shown in header)"),
-        (":mouse", "wheel-scroll vs cursor-select"),
-        ("q", "quit (asks) · :q quits directly"),
-        ("?  · Space z", "this help"),
+        ("? · F1", "this help"),
     ];
 
-    let w = 62u16.min(area.width.saturating_sub(2));
+    let w = 64u16.min(area.width.saturating_sub(2));
     let h = (rows.len() as u16 + 2).min(area.height.saturating_sub(2).max(3));
     let rect = centered(area, w, h);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(t::PURPLE))
+        .border_style(Style::default().fg(th.accent))
         .title(Span::styled(
             " aeovim — keys  (any key to close) ",
-            Style::default().fg(t::PURPLE).add_modifier(Modifier::BOLD),
+            Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(rect);
     f.render_widget(Clear, rect);
@@ -1070,15 +1700,15 @@ fn render_help(f: &mut Frame, area: Rect) {
             if k.is_empty() {
                 Line::from(Span::styled(
                     format!(" {d}"),
-                    Style::default().fg(t::PERI).add_modifier(Modifier::BOLD),
+                    Style::default().fg(th.info).add_modifier(Modifier::BOLD),
                 ))
             } else {
                 Line::from(vec![
                     Span::styled(
                         format!(" {k:>15}  "),
-                        Style::default().fg(t::PINK).add_modifier(Modifier::BOLD),
+                        Style::default().fg(th.accent2).add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(d.to_string(), Style::default().fg(t::FG)),
+                    Span::styled(d.to_string(), Style::default().fg(th.fg)),
                 ])
             }
         })
@@ -1135,15 +1765,16 @@ mod tests {
 
     #[test]
     fn wrap_preserves_styles_across_break() {
+        let th = theme::get();
         let l = Line::from(vec![
-            Span::styled("red ".to_string(), Style::default().fg(t::RED)),
-            Span::styled("bluebluexx".to_string(), Style::default().fg(t::PERI)),
+            Span::styled("red ".to_string(), Style::default().fg(th.err)),
+            Span::styled("bluebluexx".to_string(), Style::default().fg(th.info)),
         ]);
         let mut out = Vec::new();
         wrap_line_into(&l, 8, &mut out);
         assert!(out.len() >= 2);
-        // first row keeps the red span styled red
-        assert_eq!(out[0].spans[0].style.fg, Some(t::RED));
+        // first row keeps the err span styled err
+        assert_eq!(out[0].spans[0].style.fg, Some(th.err));
     }
 
     #[test]
@@ -1200,5 +1831,11 @@ mod tests {
         let t = truncate_width("日本語テキスト", 6);
         assert!(t.width() <= 6, "{t} is {} wide", t.width());
         assert!(t.ends_with('…'));
+    }
+
+    #[test]
+    fn cell_pads_to_exact_width() {
+        assert_eq!(cell("ab", 5), "ab   ");
+        assert_eq!(cell("abcdefgh", 5).width(), 5);
     }
 }

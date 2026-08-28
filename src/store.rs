@@ -33,6 +33,11 @@ pub struct PersistSpace {
     #[serde(default)]
     pub name: String,
     pub chats: Vec<PersistChat>,
+    /// The space's working directory. `default` keeps state files written
+    /// before per-space dirs existed loadable; None falls back to the
+    /// launch cwd.
+    #[serde(default)]
+    pub dir: Option<String>,
 }
 
 fn state_dir() -> Option<PathBuf> {
@@ -153,18 +158,6 @@ pub fn release_key(key: &str) {
     }
 }
 
-/// Preserve a multi-space state file (from the old build) before single-session
-/// saves overwrite it. Only the first backup is kept. Returns a user notice.
-pub fn backup_multi(key: &str) -> Option<String> {
-    let p = file(key)?;
-    let bak = p.with_extension("json.multi.bak");
-    if bak.exists() {
-        return None;
-    }
-    std::fs::copy(&p, &bak).ok()?;
-    Some(format!("older chats preserved in {}", bak.display()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,7 +177,7 @@ mod tests {
                 Entry::Note("n".into()),
             ],
         };
-        let spaces = vec![PersistSpace { name: "s".into(), chats: vec![chat] }];
+        let spaces = vec![PersistSpace { name: "s".into(), dir: None, chats: vec![chat] }];
         let json = serde_json::to_string(&spaces).unwrap();
         let back: Vec<PersistSpace> = serde_json::from_str(&json).unwrap();
         assert_eq!(back[0].chats[0].transcript.len(), 4);
@@ -207,6 +200,7 @@ mod tests {
         let key = "aeovim_selftest_persist";
         let spaces = vec![PersistSpace {
             name: "s".into(),
+            dir: None,
             chats: vec![PersistChat {
                 title: "t".into(),
                 session_id: "sid".into(),

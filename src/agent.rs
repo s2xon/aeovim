@@ -12,6 +12,7 @@
 //! accumulates diagnostics, and a supervisor waits on the child (or a kill
 //! signal) and reports `Msg::SessionEnded`.
 
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -34,6 +35,10 @@ pub struct SessionSpec {
     pub permission_mode: String,
     /// Injected via --append-system-prompt so claude knows it runs in aeovim.
     pub append_system_prompt: Option<String>,
+    /// Working directory for the child — the owning space's `dir`. Claude
+    /// resolves relative paths and searches from here, so this is what makes
+    /// a space actually "open into" a directory.
+    pub cwd: PathBuf,
 }
 
 /// Handle the app keeps per chat while its session child is alive.
@@ -89,6 +94,7 @@ fn claude_bin() -> String {
 /// `Msg::Agent { chat, ev }`; child death arrives as `Msg::SessionEnded`.
 pub fn spawn_session(spec: SessionSpec, tx: UnboundedSender<Msg>) -> anyhow::Result<SessionHandle> {
     let mut cmd = Command::new(claude_bin());
+    cmd.current_dir(&spec.cwd);
     cmd.arg("-p")
         .arg("--input-format")
         .arg("stream-json")
