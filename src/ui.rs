@@ -1519,8 +1519,13 @@ fn render_board(f: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-/// `:diff` — a quick pad over the focused chat's edit history. j/k scroll the
-/// hunk; Ctrl-j/Ctrl-k step to the older / newer diff.
+/// The diff pad, modelled on codediff.nvim in its `layout = "inline"` mode
+/// (which is what the user's config forces): full screen, a file explorer down
+/// the left, and one file's unified diff on the right. codediff draws no `+`/`-`
+/// gutter signs — the diff is carried entirely by a background wash that runs to
+/// the end of the line (`hl_eol`), with a brighter tier punched through it on
+/// the words that actually differ. Deleted lines get no line number, because
+/// there they're virtual rows that never existed in the modified buffer.
 fn render_diffpad(f: &mut Frame, area: Rect, app: &mut App) {
     let th = theme::get();
     // Cheap: rebuilds only when the chat changed since the last build.
@@ -1529,103 +1534,192 @@ fn render_diffpad(f: &mut Frame, area: Rect, app: &mut App) {
         app.overlay = Overlay::None;
         return;
     }
-    let doc = &app.diff_rows;
-    let starts = &app.diff_starts;
-
-    let w = area.width.saturating_sub(8).clamp(40, 110);
-    let h = area.height.saturating_sub(4).max(8);
-    let rect = centered(area, w, h);
-
-    let inner_h = h.saturating_sub(2) as usize; // block borders
-    let body_h = inner_h.saturating_sub(1); // footer row
-    let max_scroll = doc.len().saturating_sub(body_h.max(1));
-    app.diff_scroll = app.diff_scroll.min(max_scroll);
-    let scroll = app.diff_scroll;
-
-    // The header names whatever row is at the TOP of the viewport, so
-    // scrolling from one file's hunk into the next renames it in place.
-    let head = &doc[scroll.min(doc.len() - 1)];
-    let which = starts.iter().filter(|&&s| s <= scroll).count().max(1);
-    let title = format!(
-        " DIFF · {} · +{} −{} · file {}/{} ",
-        head.file,
-        head.added,
-        head.removed,
-        which,
-        starts.len()
-    );
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(th.border))
-        .title(Span::styled(
-            truncate_width(&title, w as usize - 2),
-            Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-        ));
-    let inner = block.inner(rect);
-    f.render_widget(Clear, rect);
-    f.render_widget(block, rect);
-    if inner.height < 2 {
+    f.render_widget(Clear, area);
+    if area.height < 4 || area.width < 24 {
         return;
     }
 
+    // Full screen, like codediff's tab page. Explorer left at 40 unless the
+    // terminal is too narrow to spare it.
+    let panel_w: u16 = if app.diff_panel {
+        40.min(area.width / 3).max(18)
+    } else {
+        0
+    };
+    let show_panel = app.diff_panel && area.width >= panel_w + 30;
+    let (panel, sep, main) = if show_panel {
+        (
+            Rect { width: panel_w, ..area },
+            Some(Rect { x: area.x + panel_w, width: 1, ..area }),
+            Rect {
+                x: area.x + panel_w + 1,
+                width: area.width - panel_w - 1,
+                ..area
+            },
+        )
+    } else {
+        (Rect { width: 0, ..area }, None, area)
+    };
+
+    if show_panel {
+        render_diff_panel(f, panel, app, th);
+    }
+    if let Some(sep) = sep {
+        // Plain vertical separator — codediff uses the window split itself.
+        let bar: Vec<Line> = (0..sep.height)
+            .map(|_| Line::from(Span::styled("│", Style::default().fg(th.gutter))))
+            .collect();
+        f.render_widget(Paragraph::new(bar), sep);
+    }
+
+    let (start, end) = app.diff_file_rows();
+    let body_h = main.height.saturating_sub(1) as usize; // footer row
+    let len = end.saturating_sub(start);
+    let max_scroll = len.saturating_sub(body_h.max(1));
+    app.diff_scroll = app.diff_scroll.min(max_scroll);
+    let scroll = app.diff_scroll;
+
+    // Number column is sized to the widest number actually on screen.
+    let numw = app.diff_rows[start..end]
+        .iter()
+        .filter_map(|r| r.num)
+        .max()
+        .map(|n| n.to_string().len().max(2))
+        .unwrap_or(2);
+
+    let avail = main.width as usize;
     let mut out: Vec<Line> = Vec::with_capacity(body_h);
-    for row in doc.iter().skip(scroll).take(body_h) {
-        match &row.line {
-            // File separator: the boundary you scroll across, spelled out in
-            // the body too so it's obvious why the header just changed.
-            None => out.push(Line::from(vec![
-                Span::styled(
-                    format!(" ▌ {} ", row.file),
-                    Style::default()
-                        .fg(th.accent)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!("+{} −{}", row.added, row.removed),
-                    Style::default().fg(th.dim),
-                ),
-            ])),
-            Some(dl) => {
-                let (marker, col) = match dl.kind {
-                    DiffKind::Add => ("+ ", th.ok),
-                    DiffKind::Del => ("- ", th.err),
-                    DiffKind::Gap => ("  ", th.gutter),
-                    DiffKind::Ctx => ("  ", th.dim),
-                };
-                out.push(Line::from(Span::styled(
-                    format!(" {marker}{}", dl.text),
-                    Style::default().fg(col),
-                )));
+    for row in app.diff_rows[start..end].iter().skip(scroll).take(body_h) {
+        let Some(dl) = &row.line else { continue };
+        let (bg, hi) = match dl.kind {
+            DiffKind::Add => (Some(th.diff_add_bg), th.diff_add_hi),
+            DiffKind::Del => (Some(th.diff_del_bg), th.diff_del_hi),
+            _ => (None, th.diff_add_hi),
+        };
+        let base = match dl.kind {
+            DiffKind::Gap => Style::default().fg(th.gutter),
+            _ => Style::default().fg(th.fg),
+        };
+        let base = match bg {
+            Some(b) => base.bg(b),
+            None => base,
+        };
+
+        // Line number: right-aligned, blank for deletions and elisions.
+        let numtxt = match row.num {
+            Some(n) => format!("{n:>numw$} "),
+            None => " ".repeat(numw + 1),
+        };
+        let mut spans = vec![Span::styled(
+            numtxt,
+            Style::default().fg(th.diff_num),
+        )];
+        let mut used = numw + 1;
+
+        // Body, split around the intra-line change so the differing run gets
+        // the brighter tier — codediff's priority-200 char highlight.
+        let text = &dl.text;
+        let segs: Vec<(&str, Style)> = match row.hl {
+            Some((s, e)) if s < e && e <= text.len() => vec![
+                (&text[..s], base),
+                (&text[s..e], base.bg(hi)),
+                (&text[e..], base),
+            ],
+            _ => vec![(text.as_str(), base)],
+        };
+        for (t, st) in segs {
+            if t.is_empty() || used >= avail {
+                continue;
             }
+            let cut = truncate_width(t, avail - used);
+            used += UnicodeWidthStr::width(cut.as_str());
+            spans.push(Span::styled(cut, st));
         }
+        // Run the wash to the edge — the `hl_eol` part, which is what makes a
+        // changed line read as a block rather than as coloured text.
+        if used < avail {
+            spans.push(Span::styled(" ".repeat(avail - used), base));
+        }
+        out.push(Line::from(spans));
     }
     let body = Rect {
-        height: inner.height - 1,
-        ..inner
+        height: main.height - 1,
+        ..main
     };
     f.render_widget(Paragraph::new(out), body);
 
     let foot = Rect {
-        y: inner.y + inner.height - 1,
+        y: main.y + main.height - 1,
         height: 1,
-        ..inner
+        ..main
     };
+    let mut help = String::from(" ]c/[c change · ]f/[f file · j/k scroll · tab panel · q close");
+    if app.diff_elided > 0 {
+        // Never let the cap hide work silently.
+        help.push_str(&format!(" · {} older file(s) not shown", app.diff_elided));
+    }
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            &if app.diff_elided > 0 {
-                // Never let the cap hide work silently.
-                format!(
-                    " j/k scroll · ⌃j/⌃k jump file · g/G top/end · esc close · {} older file(s) not shown",
-                    app.diff_elided
-                )
-            } else {
-                " j/k scroll · ⌃j/⌃k jump file · g/G top/end · esc close".to_string()
-            },
+            truncate_width(&help, avail),
             Style::default().fg(th.dim),
         ))),
         foot,
     );
+}
+
+/// codediff's explorer: a `Changes (N)` group header, then one row per file —
+/// name, dimmed parent directory, and a right-aligned status letter.
+fn render_diff_panel(f: &mut Frame, area: Rect, app: &App, th: &theme::Theme) {
+    let w = area.width as usize;
+    let mut rows: Vec<Line> = Vec::with_capacity(app.diff_starts.len() + 1);
+    rows.push(Line::from(Span::styled(
+        format!(" Changes ({})", app.diff_starts.len()),
+        Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+    )));
+
+    let vis = area.height.saturating_sub(1) as usize;
+    // Window the list so the selection stays on screen.
+    let first = app.diff_sel.saturating_sub(vis.saturating_sub(1));
+    for (i, &s) in app.diff_starts.iter().enumerate().skip(first).take(vis) {
+        let row = &app.diff_rows[s];
+        let (dir, name) = match row.file.rsplit_once('/') {
+            Some((d, n)) => (format!("{d}/"), n.to_string()),
+            None => (String::new(), row.file.clone()),
+        };
+        // A Write of a new file has nothing removed; anything else is an edit.
+        let (letter, lcol) = if row.removed == 0 && row.added > 0 {
+            ("A", th.ok)
+        } else {
+            ("M", th.warn)
+        };
+        let sel = i == app.diff_sel;
+        let namest = Style::default()
+            .fg(if sel { th.fg } else { th.fgdim })
+            .add_modifier(if sel { Modifier::BOLD } else { Modifier::empty() });
+        let namest = if sel { namest.bg(th.sel) } else { namest };
+        let dimst = Style::default().fg(th.dim);
+        let dimst = if sel { dimst.bg(th.sel) } else { dimst };
+
+        // name + dir, then pad so the status letter sits flush right.
+        let nw = UnicodeWidthStr::width(name.as_str());
+        let room = w.saturating_sub(nw + 4);
+        let dir = truncate_width(&dir, room);
+        let dw = UnicodeWidthStr::width(dir.as_str());
+        let pad = w.saturating_sub(nw + dw + 4);
+        rows.push(Line::from(vec![
+            Span::styled(if sel { " ▌" } else { "  " }.to_string(), namest),
+            Span::styled(name, namest),
+            Span::styled(" ".to_string(), dimst),
+            Span::styled(dir, dimst),
+            Span::styled(" ".repeat(pad), dimst),
+            Span::styled(
+                letter.to_string(),
+                Style::default().fg(lcol).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" ".to_string(), Style::default()),
+        ]));
+    }
+    f.render_widget(Paragraph::new(rows), area);
 }
 
 fn render_confirm(f: &mut Frame, area: Rect, app: &App) {
@@ -1671,7 +1765,7 @@ fn render_help(f: &mut Frame, area: Rect) {
         ("Ctrl-h/l · Ctrl-w w", "move between panes (and the sidebar)"),
         (":q · Ctrl-w q", "close pane — then the space"),
         ("", "REVIEW"),
-        (":diff", "diff pad · j/k scroll · ⌃j older · ⌃k newer"),
+        (":diff", "diff pad · ]c/[c change · ]f/[f file · tab panel"),
         ("Ctrl-t", "expand / collapse tool output"),
         ("", "STEER"),
         ("Ctrl-c", "interrupt (again = force) · idle: quit (asks)"),

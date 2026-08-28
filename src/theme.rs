@@ -38,6 +38,17 @@ pub struct Theme {
     pub fgdim: Color,      // de-emphasised names
     #[allow(dead_code)]
     pub faint: Color,      // timestamps (reserved)
+    // -- diff pad backgrounds (codediff.nvim's two-tier model: a soft wash over
+    // the whole line, and a brighter tier punched through it on the words that
+    // actually differ). codediff derives tier 2 by multiplying tier 1's channels
+    // by 1.4; mixing more of the base token over `bg` reads the same and keeps
+    // the palette swappable.
+    pub diff_add_bg: Color,
+    pub diff_del_bg: Color,
+    pub diff_add_hi: Color,
+    pub diff_del_hi: Color,
+    /// Line-number column inside the pad.
+    pub diff_num: Color,
     // -- mode pills (mirror lualine against the base tokens) --
     pub mode_normal: Color,
     pub mode_insert: Color,
@@ -129,6 +140,11 @@ fn build() -> Theme {
         border: mix(accent, 52, dim).color(),
         fgdim: mix(fg, 60, dim).color(),
         faint: mix(dim, 70, bg).color(),
+        diff_add_bg: mix(ok, 16, bg).color(),
+        diff_del_bg: mix(err, 16, bg).color(),
+        diff_add_hi: mix(ok, 38, bg).color(),
+        diff_del_hi: mix(err, 38, bg).color(),
+        diff_num: mix(fg, 34, bg).color(),
         mode_normal: accent2.color(),
         mode_insert: accent2.color(),
         mode_command: warn.color(),

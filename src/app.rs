@@ -108,6 +108,14 @@ pub struct DocRow {
     pub added: usize,
     pub removed: usize,
     pub line: Option<DiffLine>,
+    /// New-side line number, blank on deletions and elisions — codediff renders
+    /// removed content as unnumbered virtual rows. Hunk-relative: an Edit tool
+    /// call carries only old_string/new_string, so absolute file positions
+    /// aren't recoverable. Accurate for Write (whole file), a ruler otherwise.
+    pub num: Option<u32>,
+    /// Byte range within `line.text` that actually differs from its paired
+    /// line — codediff's tier-2 "char" highlight, punched through the wash.
+    pub hl: Option<(usize, usize)>,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -728,6 +736,82 @@ fn collapse_ctx(lines: Vec<DiffLine>) -> Vec<DiffLine> {
     out
 }
 
+/// The byte ranges of the differing middle of two paired lines: trim the common
+/// prefix and the common suffix, and what's left is what changed. Returns
+/// (range in `a`, range in `b`), or None if they're identical.
+///
+/// codediff computes a real character-level diff; prefix/suffix trimming lands
+/// on the same span for the edits people actually make (a renamed identifier, a
+/// changed argument) and costs O(n) instead of O(n·m) per line pair.
+fn inner_change(a: &str, b: &str) -> Option<((usize, usize), (usize, usize))> {
+    if a == b {
+        return None;
+    }
+    // Walk chars, not bytes — a range that splits a multi-byte char would
+    // panic the moment the renderer sliced on it.
+    let mut p = 0;
+    for (ca, cb) in a.chars().zip(b.chars()) {
+        if ca != cb {
+            break;
+        }
+        p += ca.len_utf8();
+    }
+    let mut s = 0;
+    let (mut ra, mut rb) = (a[p..].chars().rev(), b[p..].chars().rev());
+    loop {
+        match (ra.next(), rb.next()) {
+            (Some(x), Some(y)) if x == y => s += x.len_utf8(),
+            _ => break,
+        }
+    }
+    Some(((p, a.len() - s), (p, b.len() - s)))
+}
+
+/// Line numbers + intra-line change ranges for one file's hunk.
+///
+/// Numbering counts the new side (context and additions), so deletions and
+/// elisions come back as None. Intra-line ranges pair the k-th deletion of a
+/// run with the k-th addition that follows it — the same "this line became
+/// that line" assumption codediff's mapping makes.
+fn annotate(lines: &[DiffLine]) -> Vec<(Option<u32>, Option<(usize, usize)>)> {
+    let mut out: Vec<(Option<u32>, Option<(usize, usize)>)> = Vec::with_capacity(lines.len());
+    let mut n: u32 = 0;
+    for l in lines {
+        match l.kind {
+            DiffKind::Ctx | DiffKind::Add => {
+                n += 1;
+                out.push((Some(n), None));
+            }
+            DiffKind::Del | DiffKind::Gap => out.push((None, None)),
+        }
+    }
+    // Pair each Del run with the Add run directly following it.
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].kind != DiffKind::Del {
+            i += 1;
+            continue;
+        }
+        let dstart = i;
+        while i < lines.len() && lines[i].kind == DiffKind::Del {
+            i += 1;
+        }
+        let astart = i;
+        while i < lines.len() && lines[i].kind == DiffKind::Add {
+            i += 1;
+        }
+        let pairs = (astart - dstart).min(i - astart);
+        for k in 0..pairs {
+            let (d, a) = (dstart + k, astart + k);
+            if let Some((rd, ra)) = inner_change(&lines[d].text, &lines[a].text) {
+                out[d].1 = Some(rd);
+                out[a].1 = Some(ra);
+            }
+        }
+    }
+    out
+}
+
 /// Bound a rendered hunk: a Write of a 5000-line file must not become 5000
 /// transcript lines (rendered every frame, persisted every save). Head + tail
 /// with an elision marker keeps the shape visible.
@@ -843,8 +927,15 @@ pub struct App {
     /// Scanned once per picker open, not per keystroke.
     pub dir_candidates: Vec<PathBuf>,
     pub board_sel: usize,
-    /// Diff pad position: which diff (0 = newest) and the scroll within it.
+    /// Scroll within the selected file's body (not the whole document — the
+    /// pad shows one file at a time, the way codediff's explorer drives it).
     pub diff_scroll: usize,
+    /// Which file the explorer panel has selected.
+    pub diff_sel: usize,
+    /// Is the file panel showing? `Tab` toggles it (codediff's `<leader>b`).
+    pub diff_panel: bool,
+    /// Half-typed `]`/`[` waiting for its `c` or `f`.
+    diff_pending: Option<char>,
     /// Cached pad document; see `sync_diff_doc`. Cleared when the pad closes.
     pub diff_rows: Vec<DocRow>,
     pub diff_starts: Vec<usize>,
@@ -960,6 +1051,9 @@ impl App {
             dir_candidates: Vec::new(),
             board_sel: 0,
             diff_scroll: 0,
+            diff_sel: 0,
+            diff_panel: true,
+            diff_pending: None,
             diff_rows: Vec::new(),
             diff_starts: Vec::new(),
             diff_elided: 0,
@@ -1091,13 +1185,17 @@ impl App {
                 added: *added,
                 removed: *removed,
                 line: None,
+                num: None,
+                hl: None,
             });
-            for l in lines {
+            for (l, (num, hl)) in lines.iter().zip(annotate(lines)) {
                 rows.push(DocRow {
                     file: file.clone(),
                     added: *added,
                     removed: *removed,
                     line: Some(l.clone()),
+                    num,
+                    hl,
                 });
             }
         }
@@ -1105,6 +1203,76 @@ impl App {
         self.diff_starts = starts;
         self.diff_elided = elided;
         self.diff_key = Some(key);
+        // Default to the newest file, the way the pad always opened newest-first.
+        if self.diff_sel >= self.diff_starts.len() {
+            self.diff_sel = self.diff_starts.len().saturating_sub(1);
+        }
+    }
+
+    /// Row range `[start, end)` of the selected file's body, skipping the
+    /// separator row that introduces it.
+    pub fn diff_file_rows(&self) -> (usize, usize) {
+        let Some(&start) = self.diff_starts.get(self.diff_sel) else {
+            return (0, 0);
+        };
+        let end = self
+            .diff_starts
+            .get(self.diff_sel + 1)
+            .copied()
+            .unwrap_or(self.diff_rows.len());
+        (start + 1, end)
+    }
+
+    /// Select file `idx` and land on its first change — codediff's
+    /// `jump_to_first_change`, which the user has enabled.
+    fn diff_goto_file(&mut self, idx: usize) {
+        if self.diff_starts.is_empty() {
+            return;
+        }
+        self.diff_sel = idx.min(self.diff_starts.len() - 1);
+        let (start, end) = self.diff_file_rows();
+        let first = (start..end)
+            .position(|r| {
+                self.diff_rows[r]
+                    .line
+                    .as_ref()
+                    .is_some_and(|l| matches!(l.kind, DiffKind::Add | DiffKind::Del))
+            })
+            .unwrap_or(0);
+        self.diff_scroll = first.saturating_sub(3);
+    }
+
+    /// Next (`dir > 0`) or previous change block within the selected file —
+    /// codediff's `]c` / `[c`. Blocks are runs of Add/Del, so a delete
+    /// immediately followed by its replacement counts once.
+    fn diff_hunk(&mut self, dir: isize) {
+        let (start, end) = self.diff_file_rows();
+        if start >= end {
+            return;
+        }
+        let changed = |r: usize| -> bool {
+            self.diff_rows[r]
+                .line
+                .as_ref()
+                .is_some_and(|l| matches!(l.kind, DiffKind::Add | DiffKind::Del))
+        };
+        // Block starts: a changed row whose predecessor wasn't changed.
+        let heads: Vec<usize> = (start..end)
+            .filter(|&r| changed(r) && (r == start || !changed(r - 1)))
+            .collect();
+        if heads.is_empty() {
+            return;
+        }
+        // diff_scroll is relative to the file body; heads are absolute rows.
+        let cur = start + self.diff_scroll;
+        let target = if dir > 0 {
+            heads.iter().find(|&&h| h > cur + 3).copied()
+        } else {
+            heads.iter().rev().find(|&&h| h + 3 < cur).copied()
+        };
+        if let Some(t) = target {
+            self.diff_scroll = (t - start).saturating_sub(3);
+        }
     }
 
     /// Drop the cached document when the pad closes — it can be a few hundred
@@ -1495,10 +1663,11 @@ impl App {
                 self.mode = Mode::Command;
             }
             KeyCode::Char('/') => {
+                // Always type the slash — on an empty draft it opens the
+                // command popup, otherwise it's just a character. Dropping it
+                // when a draft existed made the keystroke vanish silently.
                 self.enter_insert(true);
-                if self.input.is_empty() {
-                    self.insert_at_cursor("/");
-                }
+                self.insert_at_cursor("/");
             }
             KeyCode::Char(' ') => self.pending = Pending::Leader,
             KeyCode::Char('g') => self.pending = Pending::G,
@@ -1736,7 +1905,7 @@ impl App {
             KeyCode::Char('c') if ctrl => self.mode = Mode::Normal,
             KeyCode::Char('u') if ctrl => self.rename_buf.clear(),
             KeyCode::Char('v') if ctrl => self.paste_from_clipboard(),
-            KeyCode::Char(c) => self.rename_buf.push(c),
+            KeyCode::Char(c) if !ctrl => self.rename_buf.push(c),
             _ => {}
         }
     }
@@ -1855,24 +2024,41 @@ impl App {
 
     fn open_diff_pad(&mut self) {
         self.sync_diff_doc();
-        let Some(&last) = self.diff_starts.last() else {
+        if self.diff_starts.is_empty() {
             self.clear_diff_doc();
             self.toast = Some("no diffs in this chat yet".into());
             return;
-        };
-        // Open on the newest change, with the whole session's history
-        // scrollable above it.
-        self.diff_scroll = last;
+        }
+        // Open on the newest file, landing on its first change.
+        self.diff_pending = None;
+        self.diff_goto_file(self.diff_starts.len().saturating_sub(1));
         self.overlay = Overlay::DiffPad;
         self.mode = Mode::Normal;
     }
 
     fn key_diffpad(&mut self, k: KeyEvent) {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-        let starts = self.diff_starts.clone();
-        if starts.is_empty() {
+        let nfiles = self.diff_starts.len();
+        if nfiles == 0 {
             self.overlay = Overlay::None;
             self.clear_diff_doc();
+            return;
+        }
+        // `]`/`[` are two-key motions: ]c/[c change, ]f/[f file (codediff's).
+        if let Some(br) = self.diff_pending.take() {
+            let dir = if br == ']' { 1isize } else { -1 };
+            match k.code {
+                KeyCode::Char('c') => self.diff_hunk(dir),
+                KeyCode::Char('f') => {
+                    let next = if dir > 0 {
+                        (self.diff_sel + 1).min(nfiles - 1)
+                    } else {
+                        self.diff_sel.saturating_sub(1)
+                    };
+                    self.diff_goto_file(next);
+                }
+                _ => {}
+            }
             return;
         }
         match k.code {
@@ -1880,21 +2066,15 @@ impl App {
                 self.overlay = Overlay::None;
                 self.clear_diff_doc();
             }
-            // Ctrl-j/k jump whole files; j/k scroll the continuous document.
+            KeyCode::Char(']') if !ctrl => self.diff_pending = Some(']'),
+            KeyCode::Char('[') if !ctrl => self.diff_pending = Some('['),
+            KeyCode::Tab => self.diff_panel = !self.diff_panel,
+            // Ctrl-j/k step files, as they always have.
             KeyCode::Char('j') | KeyCode::Down if ctrl => {
-                self.diff_scroll = starts
-                    .iter()
-                    .copied()
-                    .find(|&s| s > self.diff_scroll)
-                    .unwrap_or(self.diff_scroll);
+                self.diff_goto_file((self.diff_sel + 1).min(nfiles - 1))
             }
             KeyCode::Char('k') | KeyCode::Up if ctrl => {
-                self.diff_scroll = starts
-                    .iter()
-                    .copied()
-                    .rev()
-                    .find(|&s| s < self.diff_scroll)
-                    .unwrap_or(0);
+                self.diff_goto_file(self.diff_sel.saturating_sub(1))
             }
             KeyCode::Char('j') | KeyCode::Down => self.diff_scroll += 1,
             KeyCode::Char('k') | KeyCode::Up => {
@@ -2073,6 +2253,12 @@ impl App {
             self.toast = Some(format!("already in {shown}"));
             return;
         }
+        // Changing dir kills every child in the space, so a running turn would
+        // die and surface as a session error. Make the user interrupt first.
+        if sp.chats.iter().any(|c| c.in_flight) {
+            self.toast = Some("turn still running — Ctrl-c first, then :cd".into());
+            return;
+        }
         self.prev_dir = Some(std::mem::replace(&mut sp.dir, dir));
         let mut restarted = 0;
         for c in &mut sp.chats {
@@ -2238,7 +2424,9 @@ impl App {
             }
             KeyCode::PageUp => self.scroll_up(12),
             KeyCode::PageDown => self.scroll_down(12),
-            KeyCode::Char(c) => {
+            // `!ctrl` or an unhandled chord (Ctrl-b, Ctrl-x, …) types its bare
+            // letter into the composer instead of being ignored.
+            KeyCode::Char(c) if !ctrl => {
                 let mut buf = [0u8; 4];
                 self.insert_at_cursor(c.encode_utf8(&mut buf));
             }
@@ -2591,6 +2779,14 @@ Claude Code CLI. Working directory: {cwd}. You're in a terminal on macOS \
         if c.interrupting {
             if let Some(s) = &c.session {
                 s.kill();
+            } else {
+                // Second press with no child left to kill: nothing will ever
+                // send SessionEnded, so clear the turn here or the chat stays
+                // in_flight forever with no way out but quitting.
+                c.in_flight = false;
+                c.interrupting = false;
+                c.turn_started = None;
+                c.activity = None;
             }
             return;
         }
@@ -2708,6 +2904,11 @@ Claude Code CLI. Working directory: {cwd}. You're in a terminal on macOS \
         // up — turns on one chat are strictly sequential.
         let si = self.active;
         let ci = self.spaces[si].focused.min(self.spaces[si].chats.len() - 1);
+        // Name the space off its first prompt — before the queue check, so a
+        // prompt that lands while a turn is running still names it.
+        if is_default_name(&self.spaces[si].name) {
+            self.spaces[si].name = slug(&prompt);
+        }
         if self.spaces[si].chats[ci].in_flight {
             let c = &mut self.spaces[si].chats[ci];
             c.queue.push(prompt);
@@ -2715,10 +2916,6 @@ Claude Code CLI. Working directory: {cwd}. You're in a terminal on macOS \
             return;
         }
         {
-            // Name the space off its first prompt.
-            if is_default_name(&self.spaces[si].name) {
-                self.spaces[si].name = slug(&prompt);
-            }
             let c = &mut self.spaces[si].chats[ci];
             c.push(Entry::User(prompt.clone()));
             c.last_prompt = Some(prompt.clone());
@@ -2774,6 +2971,57 @@ mod tests {
         assert_eq!((added, removed), (1, 1));
         // context a/c kept, b→B shown as -/+
         assert_eq!(render(&lines), " a\n-b\n+B\n c");
+    }
+
+    #[test]
+    fn inner_change_isolates_the_changed_run() {
+        // Common prefix and suffix are trimmed; only the middle is reported.
+        let (d, a) = inner_change("let x = old_value();", "let x = new_value();").unwrap();
+        assert_eq!(&"let x = old_value();"[d.0..d.1], "old");
+        assert_eq!(&"let x = new_value();"[a.0..a.1], "new");
+        // Identical lines have no inner change at all.
+        assert!(inner_change("same", "same").is_none());
+        // A pure append reports only the appended tail.
+        let (d, a) = inner_change("foo", "foobar").unwrap();
+        assert_eq!(d.0, d.1, "nothing removed");
+        assert_eq!(&"foobar"[a.0..a.1], "bar");
+    }
+
+    #[test]
+    fn inner_change_never_splits_a_multibyte_char() {
+        // Byte ranges that landed mid-codepoint used to panic the renderer the
+        // moment it sliced on them.
+        for (a, b) in [("héllo wörld", "héllo wérld"), ("→x", "→y"), ("🙂a", "🙂b")] {
+            let (ra, rb) = inner_change(a, b).unwrap();
+            assert!(a.is_char_boundary(ra.0) && a.is_char_boundary(ra.1));
+            assert!(b.is_char_boundary(rb.0) && b.is_char_boundary(rb.1));
+            // And the ranges must actually be sliceable.
+            let _ = (&a[ra.0..ra.1], &b[rb.0..rb.1]);
+        }
+    }
+
+    #[test]
+    fn annotate_numbers_the_new_side_and_pairs_changes() {
+        let (_, _, lines) = line_diff("a\nold\nc", "a\nnew\nc");
+        let ann = annotate(&lines);
+        assert_eq!(lines.len(), ann.len());
+        for (l, (num, hl)) in lines.iter().zip(&ann) {
+            match l.kind {
+                // Deletions are unnumbered virtual rows, as in codediff.
+                DiffKind::Del => {
+                    assert!(num.is_none(), "deletion must not be numbered");
+                    assert!(hl.is_some(), "old→new pair must carry an inner change");
+                }
+                DiffKind::Add => {
+                    assert!(num.is_some(), "addition must be numbered");
+                    assert!(hl.is_some());
+                }
+                _ => {}
+            }
+        }
+        // Context and additions number the new side consecutively: a=1, new=2, c=3.
+        let nums: Vec<u32> = ann.iter().filter_map(|(n, _)| *n).collect();
+        assert_eq!(nums, vec![1, 2, 3]);
     }
 
     #[test]

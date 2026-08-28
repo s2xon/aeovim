@@ -16,10 +16,11 @@ It wraps the `claude` CLI (Claude Code) as one long-lived child over headless `s
 
 - **Spaces, one surface:** the SPACES sidebar lists every space with a live status glyph (`●`/`○` running flash · `✗` error · `✓` idle). `Space ee` toggles it, `Space 1-0` / `gt` / `ga` (fuzzy picker) jump, `Space n` spawns, `d` deletes, `r` renames. Each chat is its own long-lived claude child; everything persists per tmux session and resumes via `--resume` (stale sessions self-heal).
 - **Two chats per space:** `:vs` (or `Ctrl-w v`) adds a second chat pane — a thin-divider vsplit with slim `▎ chat N` headers. `Ctrl-h`/`Ctrl-l` (and `Ctrl-w`) walk sidebar ↔ pane ↔ pane; `:q` closes the focused pane, then the space; the composer always talks to the focused pane.
-- **Diff pad:** `:diff` opens a quick buffer over the focused chat's edit history — newest first, `j`/`k` scrolls the hunk, `Ctrl-j`/`Ctrl-k` steps to older/newer diffs.
+- **Diff pad, codediff-style:** `:diff` opens a full-screen review of the focused chat's edit history, modelled on [codediff.nvim](https://github.com/esmuellert/codediff.nvim) in its `inline` layout — a `Changes (N)` explorer down the left, the selected file's unified diff on the right. No `+`/`-` gutter signs: changed lines carry a background wash that runs to the end of the line, with a brighter tier punched through it on the words that actually differ. Deleted lines are unnumbered, the way codediff renders them as virtual rows. `]c`/`[c` step changes, `]f`/`[f` (or `Ctrl-j`/`Ctrl-k`) step files, `Tab` hides the explorer, `q` closes.
 - **Modal, the vim way:** Insert on launch (Enter sends, stays Insert), `Esc` → Normal (scroll, jump, operate), `:` ex commands (`:q` `:vs` `:new` `:clear` `:diff` `:tasks` `:rename` `:cost` `:status` `:N`), `?` help. Mode pill in the statusline: NORMAL / INSERT / COMMAND / RENAME / CONFIRM.
-- **Codex-simple chrome:** header is name + model; statusline is mode + name + a spinner only while the focused turn runs. No cost, ids, or permission flags on screen — `:cost` and `:status` answer those on demand.
+- **Codex-simple chrome:** header is name + model; statusline is mode + name + a spinner only while the focused turn runs. No cost, ids, or permission flags on screen — `:cost` and `:status` answer those on demand as statusline toasts (truncated to 60 columns; no overlay yet).
 - **Tasks:** `:tasks` / `Space t` — one row per chat (state · elapsed · last line); `⏎` focuses, `x` cancels that chat's turn.
+- **Directories:** each space owns a working directory — `:cd <path>`, `:cd -`, bare `:cd` / `gd` for a fuzzy picker over `$HOME`, `:pwd` to check. Changing it restarts the space's children in the new cwd (refused mid-turn).
 - **Colour-agnostic theme:** ten base tokens (lilac by default, straight from the author's nvim theme) with every panel/border/selection derived by mixing; override any token in `~/.config/aeovim/theme.toml` and the whole UI rethemes. The terminal background stays transparent.
 - **Long-lived child:** one persistent `claude` process driven over stdin `--input-format stream-json`. Follow-up turns skip the session-reload cost entirely; the child survives across turns and interrupts.
 - **Interrupt:** `Ctrl-C` (or `Esc` in Normal) interrupts the running turn via the control protocol (child stays alive; press again to force-kill). Quitting kills every child — nothing keeps editing files invisibly.
@@ -65,7 +66,7 @@ Modal — Insert on launch, `Esc` is Normal. The authoritative, in-app reference
 | `Space 1-0` · `gt`/`gT` · `ga` | jump to space N · cycle · fuzzy picker |
 | `Space n` · `Space t` | new space · tasks |
 | `:vs` · `Ctrl-w v/h/l/w/q` | split into two chats · vim window commands |
-| `:diff` | diff pad — `j/k` scroll · `Ctrl-j/k` older/newer |
+| `:diff` | diff pad — `]c/[c` change · `]f/[f` file · `j/k` scroll · `Tab` panel |
 | `:` | `:q` (pane→space) `:qa` `:new` `:clear` `:rename` `:tasks` `:cost` `:status` `:N` |
 | `j`/`k` · `Ctrl-d`/`u` · `gg`/`G` | scroll (Normal) |
 | `Ctrl-t` | expand / collapse tool output |
