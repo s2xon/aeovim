@@ -231,7 +231,7 @@ fn print_help() {
     println!("  Space n          new space                 Space t / :tasks     tasks");
     println!("  :vs / Ctrl-w v   split: second chat        Ctrl-h/l / Ctrl-w    move panes");
     println!("  :q               close pane, then space    :qa quit · :q! now");
-    println!("  :diff            diff pad (j/k scroll, Ctrl-j older, Ctrl-k newer)");
+    println!("  :diff            diff pad (]c/[c change, ]f/[f file, tab panel, q close)");
     println!("  :cost / :status  spend + session info (kept off the chrome)");
     println!("  Ctrl-t           expand/collapse tool output     ? / F1  keys cheatsheet");
     println!("  THEME: colour-agnostic — override tokens in ~/.config/aeovim/theme.toml");

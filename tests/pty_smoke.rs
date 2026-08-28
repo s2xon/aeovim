@@ -427,13 +427,14 @@ fn sidebar_picker_and_board_drive_multiple_sessions() {
         h.screen_text()
     );
 
-    // `:diff` opens the diff pad over this chat's edit history.
+    // `:diff` opens the diff pad over this chat's edit history: a codediff-style
+    // explorer on the left, the selected file's diff on the right.
     h.keys(":diff\r");
-    h.assert_on_screen("DIFF", 5);
+    h.assert_on_screen("Changes (", 5);
     h.assert_on_screen("demo.rs", 5);
     h.keys("\x1b");
     assert!(
-        h.wait_gone("DIFF", 3),
+        h.wait_gone("Changes (", 3),
         "diff pad must close on Esc\n{}",
         h.screen_text()
     );
@@ -486,28 +487,45 @@ fn dir_picker_and_multi_file_diff_pad() {
     h.keys(":cd /nope/not/here\r");
     h.assert_on_screen("not a directory", 5);
 
-    // The diff pad opens on the NEWEST file and knows it is one of two.
+    // The pad lists every file changed this session in its explorer, and opens
+    // on the newest one. Both files are on screen at once — the panel is the
+    // index, the right pane shows only the selection (codediff's model).
     h.keys(":diff\r");
-    h.assert_on_screen("DIFF", 5);
+    h.assert_on_screen("Changes (2)", 5);
     h.assert_on_screen("util.rs", 5);
-    h.assert_on_screen("file 2/2", 5);
-
-    // Ctrl-k jumps back a whole file — the header renames to the older one.
-    h.keys("\x0b");
     h.assert_on_screen("demo.rs", 5);
-    h.assert_on_screen("file 1/2", 5);
+    // The newest file's content is what's rendered: util.rs got y00..y29.
+    h.assert_on_screen("y00", 5);
 
-    // Scrolling down far enough crosses the boundary into util.rs, and the
-    // header follows the row at the top of the viewport.
-    for _ in 0..14 {
-        h.keys("j");
-    }
-    h.assert_on_screen("util.rs", 5);
-    h.assert_on_screen("file 2/2", 5);
+    // `[f` steps to the older file; its content replaces the pane. (Ctrl-k
+    // still does the same, so the old binding keeps working.)
+    h.keys("[f");
+    assert!(
+        h.wait_gone("y00", 3),
+        "[f must switch the pane to demo.rs\n{}",
+        h.screen_text()
+    );
+    // demo.rs is `a` → `b\nc`: the added lines are what remain.
+    h.assert_on_screen("Changes (2)", 5);
+
+    // `]f` goes back to the newest file.
+    h.keys("]f");
+    h.assert_on_screen("y00", 5);
+
+    // Tab hides the explorer; the diff stays.
+    h.keys("\t");
+    assert!(
+        h.wait_gone("Changes (2)", 3),
+        "tab must hide the file panel\n{}",
+        h.screen_text()
+    );
+    h.assert_on_screen("y00", 5);
+    h.keys("\t");
+    h.assert_on_screen("Changes (2)", 5);
 
     h.keys("\x1b");
     assert!(
-        h.wait_gone("DIFF", 3),
+        h.wait_gone("Changes (2)", 3),
         "diff pad must close on Esc\n{}",
         h.screen_text()
     );
@@ -523,3 +541,4 @@ fn dir_picker_and_multi_file_diff_pad() {
         std::thread::sleep(Duration::from_millis(50));
     }
 }
+
