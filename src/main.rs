@@ -17,7 +17,8 @@ use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::event::{
-    EventStream, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, EnableBracketedPaste, EventStream, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -74,7 +75,9 @@ async fn main() -> Result<()> {
     install_panic_hook();
     enable_raw_mode()?;
     let enhanced = supports_keyboard_enhancement().unwrap_or(false);
-    execute!(stdout(), EnterAlternateScreen)?;
+    // Bracketed paste: multi-line pastes arrive as one Event::Paste instead of
+    // key events (a pasted newline would otherwise send the prompt early).
+    execute!(stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
     if enhanced {
         // Disambiguate Ctrl-h from Backspace etc. (Ghostty/kitty protocol).
         let _ = execute!(
@@ -135,7 +138,7 @@ async fn main() -> Result<()> {
         let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
     }
     disable_raw_mode().ok();
-    execute!(terminal.backend_mut(), LeaveAlternateScreen).ok();
+    execute!(terminal.backend_mut(), DisableBracketedPaste, LeaveAlternateScreen).ok();
     terminal.show_cursor().ok();
     res
 }
@@ -146,16 +149,28 @@ async fn run(
     mut rx: UnboundedReceiver<Msg>,
 ) -> Result<()> {
     terminal.draw(|f| ui::render(f, app))?;
+    // Coalesce redraws: streaming events only mark the UI dirty and the next
+    // tick (~120ms) paints once — otherwise four streaming agents would force
+    // a full redraw per token. Key input still paints immediately.
+    let mut dirty = false;
     while let Some(msg) = rx.recv().await {
         let is_tick = matches!(msg, Msg::Tick);
+        let is_input = matches!(msg, Msg::Input(_));
         app.handle(msg);
         if app.should_quit {
             break;
         }
-        if is_tick && !app.any_in_flight() {
-            continue;
+        if is_input {
+            terminal.draw(|f| ui::render(f, app))?;
+            dirty = false;
+        } else if is_tick {
+            if dirty || app.any_in_flight() {
+                terminal.draw(|f| ui::render(f, app))?;
+                dirty = false;
+            }
+        } else {
+            dirty = true;
         }
-        terminal.draw(|f| ui::render(f, app))?;
     }
     Ok(())
 }
@@ -198,7 +213,7 @@ fn install_panic_hook() {
     std::panic::set_hook(Box::new(move |info| {
         let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
         let _ = disable_raw_mode();
-        let _ = execute!(stdout(), LeaveAlternateScreen);
+        let _ = execute!(stdout(), DisableBracketedPaste, LeaveAlternateScreen);
         orig(info);
     }));
 }
@@ -218,6 +233,13 @@ fn print_help() {
     println!("  Space 0-9        jump to chat N in group  Ctrl-h/l   focus left / right");
     println!("  (in sidebar) j/k move   a add+name   r rename   d close   Enter open");
     println!("  Space t o/x/n/p  new/close/next/prev chat");
-    println!("  Space s ...      splits (coming next)     : command   q quit");
+    println!("  Space s ...      splits / zoom / pop      : command   q quit");
+    println!("  /                search transcript (n/N next/prev, Esc clear)");
+    println!("  y / Y            yank last reply / its last code block (pbcopy)");
+    println!("  za               expand/collapse tool results   zz recenter");
+    println!("  Alt-Enter        newline in composer; pasted newlines are safe");
+    println!("COMMANDS: :w <file> export md  :cd <dir> space cwd  :model <m> per chat");
+    println!("          :all <prompt> broadcast to space   :q quit (:q! force)");
+    println!("  prompts sent while a chat is busy queue and auto-send in order");
     println!("  sessions persist per tmux session — relaunch avim to resume");
 }

@@ -12,6 +12,9 @@ pub struct PersistChat {
     pub session_id: String,
     #[serde(default)]
     pub cost: f64,
+    /// Per-chat model override (`:model`).
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -19,6 +22,9 @@ pub struct PersistSpace {
     #[serde(default)]
     pub name: String,
     pub chats: Vec<PersistChat>,
+    /// Per-space working directory (`:cd`); None = avim's launch cwd.
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
 fn state_dir() -> Option<PathBuf> {
@@ -57,6 +63,27 @@ fn file(key: &str) -> Option<PathBuf> {
 /// FIFO the LLMs write to in order to message another space.
 pub fn pipe_path(key: &str) -> Option<PathBuf> {
     Some(state_dir()?.join(format!("{key}.pipe")))
+}
+
+/// Claude Code stores full session transcripts at
+/// `~/.claude/projects/<cwd-slug>/<session-id>.jsonl` (slug: non-alnum → '-').
+pub fn session_transcript_path(cwd: &str, session_id: &str) -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    let slug: String = cwd
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    Some(
+        PathBuf::from(home)
+            .join(".claude/projects")
+            .join(slug)
+            .join(format!("{session_id}.jsonl")),
+    )
+}
+
+/// Read a session's stored transcript, if one exists.
+pub fn session_transcript(cwd: &str, session_id: &str) -> Option<String> {
+    std::fs::read_to_string(session_transcript_path(cwd, session_id)?).ok()
 }
 
 pub fn load(key: &str) -> Vec<PersistSpace> {

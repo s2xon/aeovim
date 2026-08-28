@@ -14,6 +14,8 @@ pub enum AgentEvent {
         slash_commands: Vec<String>,
     },
     TextDelta(String),
+    /// Streaming extended-thinking text (shown dim while the agent reasons).
+    ThinkingDelta(String),
     AssistantFinal(String),
     /// A tool the agent invoked (Edit/Write/Bash/Read/…), with its input.
     ToolCall {
@@ -29,10 +31,12 @@ pub enum AgentEvent {
         cost_usd: f64,
         is_error: bool,
         text: Option<String>,
+        /// Input-side tokens of the final request (incl. cache) ≈ context size.
+        context_tokens: u64,
     },
 }
 
-fn tool_result_text(c: &Value) -> String {
+pub fn tool_result_text(c: &Value) -> String {
     if let Some(s) = c.as_str() {
         return s.to_string();
     }
@@ -93,10 +97,20 @@ pub fn parse_line(line: &str) -> Vec<AgentEvent> {
                 .unwrap_or("");
             if etype == "content_block_delta" {
                 let delta = ev.and_then(|e| e.get("delta"));
-                if delta.and_then(|d| d.get("type")).and_then(Value::as_str) == Some("text_delta") {
-                    if let Some(t) = delta.and_then(|d| d.get("text")).and_then(Value::as_str) {
-                        return vec![AgentEvent::TextDelta(t.to_string())];
+                match delta.and_then(|d| d.get("type")).and_then(Value::as_str) {
+                    Some("text_delta") => {
+                        if let Some(t) = delta.and_then(|d| d.get("text")).and_then(Value::as_str) {
+                            return vec![AgentEvent::TextDelta(t.to_string())];
+                        }
                     }
+                    Some("thinking_delta") => {
+                        if let Some(t) =
+                            delta.and_then(|d| d.get("thinking")).and_then(Value::as_str)
+                        {
+                            return vec![AgentEvent::ThinkingDelta(t.to_string())];
+                        }
+                    }
+                    _ => {}
                 }
             }
             vec![]
@@ -170,12 +184,80 @@ pub fn parse_line(line: &str) -> Vec<AgentEvent> {
             out
         }
 
-        "result" => vec![AgentEvent::TurnResult {
-            cost_usd: v.get("total_cost_usd").and_then(Value::as_f64).unwrap_or(0.0),
-            is_error: v.get("is_error").and_then(Value::as_bool).unwrap_or(false),
-            text: v.get("result").and_then(Value::as_str).map(String::from),
-        }],
+        "result" => {
+            let usage = v.get("usage");
+            let tok = |k: &str| {
+                usage
+                    .and_then(|u| u.get(k))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+            };
+            let context_tokens = tok("input_tokens")
+                + tok("cache_read_input_tokens")
+                + tok("cache_creation_input_tokens");
+            vec![AgentEvent::TurnResult {
+                cost_usd: v.get("total_cost_usd").and_then(Value::as_f64).unwrap_or(0.0),
+                is_error: v.get("is_error").and_then(Value::as_bool).unwrap_or(false),
+                text: v.get("result").and_then(Value::as_str).map(String::from),
+                context_tokens,
+            }]
+        }
 
         _ => vec![],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn init_line() {
+        let l = r#"{"type":"system","subtype":"init","session_id":"abc","model":"claude-x","slash_commands":["/foo","/bar"]}"#;
+        match &parse_line(l)[..] {
+            [AgentEvent::Init { session_id, model, slash_commands }] => {
+                assert_eq!(session_id.as_deref(), Some("abc"));
+                assert_eq!(model.as_deref(), Some("claude-x"));
+                assert_eq!(slash_commands, &["foo", "bar"]);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn text_and_thinking_deltas() {
+        let t = r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}}"#;
+        assert!(matches!(&parse_line(t)[..], [AgentEvent::TextDelta(s)] if s == "hi"));
+        let th = r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"hmm"}}}"#;
+        assert!(matches!(&parse_line(th)[..], [AgentEvent::ThinkingDelta(s)] if s == "hmm"));
+    }
+
+    #[test]
+    fn assistant_tools_and_result_usage() {
+        let a = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"x"},{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}}"#;
+        match &parse_line(a)[..] {
+            [AgentEvent::ToolCall { name, input }] => {
+                assert_eq!(name, "Bash");
+                assert_eq!(input.get("command").and_then(Value::as_str), Some("ls"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        let r = r#"{"type":"result","total_cost_usd":0.5,"is_error":false,"result":"done","usage":{"input_tokens":10,"cache_read_input_tokens":90,"cache_creation_input_tokens":5}}"#;
+        match &parse_line(r)[..] {
+            [AgentEvent::TurnResult { cost_usd, is_error, text, context_tokens }] => {
+                assert_eq!(*cost_usd, 0.5);
+                assert!(!is_error);
+                assert_eq!(text.as_deref(), Some("done"));
+                assert_eq!(*context_tokens, 105);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn garbage_is_ignored() {
+        assert!(parse_line("not json").is_empty());
+        assert!(parse_line("").is_empty());
+        assert!(parse_line(r#"{"type":"weird"}"#).is_empty());
     }
 }

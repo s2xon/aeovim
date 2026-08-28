@@ -23,6 +23,20 @@ pub enum Mode {
     Rename,
     Picker,
     Confirm,
+    Search,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+pub enum ConfirmAction {
+    DeleteSpaces,
+    Quit,
+}
+
+/// Something happened in a chat while its space wasn't on screen.
+#[derive(PartialEq, Clone, Copy)]
+pub enum Attn {
+    Done,
+    Error,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -79,13 +93,28 @@ pub struct Chat {
     pub autonamed: bool,
     pub transcript: Vec<Entry>,
     pub streaming: Option<String>,
+    /// Streaming extended-thinking text (tail only; shown dim while working).
+    pub thinking: Option<String>,
     pub in_flight: bool,
     pub session_id: String,
     pub first_turn: bool,
     pub cost: f64,
+    /// Input-side tokens of the last turn ≈ context size.
+    pub context_tokens: u64,
     pub scroll: u16,
     pub follow: bool,
     pub last_max_scroll: u16,
+    /// Body width at last render — lets search wrap lines exactly like the UI.
+    pub last_body_width: u16,
+    /// `za`: show tool results in full instead of one-line summaries.
+    pub expand_tools: bool,
+    /// Per-chat model override (`:model`).
+    pub model: Option<String>,
+    pub attention: Option<Attn>,
+    /// Prompts waiting for the current turn to finish (type-ahead, pipe, :all).
+    pub queued: Vec<String>,
+    last_prompt: String,
+    session_retry: bool,
 }
 
 impl Chat {
@@ -99,35 +128,56 @@ impl Chat {
             autonamed: false,
             transcript,
             streaming: None,
+            thinking: None,
             in_flight: false,
             session_id,
             first_turn: true,
             cost: 0.0,
+            context_tokens: 0,
             scroll: 0,
             follow: true,
             last_max_scroll: 0,
+            last_body_width: 0,
+            expand_tools: false,
+            model: None,
+            attention: None,
+            queued: Vec::new(),
+            last_prompt: String::new(),
+            session_retry: false,
         }
     }
 
-    fn from_persist(id: u64, pc: &PersistChat) -> Self {
-        let mut transcript = Vec::new();
-        transcript.push(Entry::Note(format!(
-            "resumed · session {} (send a message to continue)",
-            &pc.session_id[..8.min(pc.session_id.len())]
-        )));
+    fn from_persist(id: u64, pc: &PersistChat, cwd: &str) -> Self {
+        let mut transcript = replay_transcript(cwd, &pc.session_id);
+        let short = &pc.session_id[..8.min(pc.session_id.len())];
+        let note = if transcript.is_empty() {
+            format!("resumed · session {short} (send a message to continue)")
+        } else {
+            format!("resumed · session {short} · history restored")
+        };
+        transcript.push(Entry::Note(note));
         Chat {
             id,
             title: pc.title.clone(),
             autonamed: true,
             transcript,
             streaming: None,
+            thinking: None,
             in_flight: false,
             session_id: pc.session_id.clone(),
             first_turn: false,
             cost: pc.cost,
+            context_tokens: 0,
             scroll: 0,
             follow: true,
             last_max_scroll: 0,
+            last_body_width: 0,
+            expand_tools: false,
+            model: pc.model.clone(),
+            attention: None,
+            queued: Vec::new(),
+            last_prompt: String::new(),
+            session_retry: false,
         }
     }
 
@@ -147,6 +197,8 @@ pub struct Space {
     pub focused: usize,
     pub split_dir: SplitDir,
     pub zoom: bool,
+    /// Working directory for this space's agents (`:cd`); None = launch cwd.
+    pub cwd: Option<String>,
 }
 
 impl Space {
@@ -158,6 +210,7 @@ impl Space {
             focused: 0,
             split_dir: SplitDir::V,
             zoom: false,
+            cwd: None,
         }
     }
     pub fn fi(&self) -> usize {
@@ -255,7 +308,7 @@ fn truncate_str(s: &str, n: usize) -> String {
 }
 
 /// Compact a tool result to one clean line (+N lines) for the transcript.
-fn tool_result_summary(text: &str) -> String {
+pub fn tool_result_summary(text: &str) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let first = lines
         .iter()
@@ -323,6 +376,167 @@ fn format_todos(input: &Value) -> String {
     out
 }
 
+/// Rebuild a chat's transcript from Claude Code's stored session JSONL
+/// (`~/.claude/projects/...`). Best-effort: unknown lines are skipped.
+fn replay_transcript(cwd: &str, session_id: &str) -> Vec<Entry> {
+    let Some(data) = store::session_transcript(cwd, session_id) else {
+        return Vec::new();
+    };
+    let mut out: Vec<Entry> = Vec::new();
+    let push_unique = |out: &mut Vec<Entry>, e: Entry| {
+        // session files can repeat a message (one line per content block)
+        let dup = match (&e, out.last()) {
+            (Entry::User(a), Some(Entry::User(b))) => a == b,
+            (Entry::Assistant(a), Some(Entry::Assistant(b))) => a == b,
+            _ => false,
+        };
+        if !dup {
+            out.push(e);
+        }
+    };
+    for line in data.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+        if v.get("isMeta").and_then(Value::as_bool).unwrap_or(false)
+            || v.get("isSidechain").and_then(Value::as_bool).unwrap_or(false)
+        {
+            continue;
+        }
+        match v.get("type").and_then(Value::as_str) {
+            Some("user") => {
+                let Some(content) = v.get("message").and_then(|m| m.get("content")) else {
+                    continue;
+                };
+                if let Some(s) = content.as_str() {
+                    if !looks_meta(s) && !s.trim().is_empty() {
+                        push_unique(&mut out, Entry::User(s.to_string()));
+                    }
+                } else if let Some(arr) = content.as_array() {
+                    for b in arr {
+                        match b.get("type").and_then(Value::as_str) {
+                            Some("text") => {
+                                let t = b.get("text").and_then(Value::as_str).unwrap_or("");
+                                if !looks_meta(t) && !t.trim().is_empty() {
+                                    push_unique(&mut out, Entry::User(t.to_string()));
+                                }
+                            }
+                            Some("tool_result") => {
+                                let ok = !b
+                                    .get("is_error")
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(false);
+                                let text = b
+                                    .get("content")
+                                    .map(crate::protocol::tool_result_text)
+                                    .unwrap_or_default();
+                                if !text.trim().is_empty() {
+                                    out.push(Entry::ToolResult { ok, text });
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            Some("assistant") => {
+                let Some(arr) = v
+                    .get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(Value::as_array)
+                else {
+                    continue;
+                };
+                let mut text = String::new();
+                for b in arr {
+                    match b.get("type").and_then(Value::as_str) {
+                        Some("text") => {
+                            text.push_str(b.get("text").and_then(Value::as_str).unwrap_or(""))
+                        }
+                        Some("tool_use") => {
+                            if !text.trim().is_empty() {
+                                push_unique(&mut out, Entry::Assistant(std::mem::take(&mut text)));
+                            }
+                            let name = b.get("name").and_then(Value::as_str).unwrap_or("tool");
+                            let input = b.get("input").cloned().unwrap_or(Value::Null);
+                            out.push(Entry::Tool(format_tool(name, &input)));
+                        }
+                        _ => {}
+                    }
+                }
+                if !text.trim().is_empty() {
+                    push_unique(&mut out, Entry::Assistant(text));
+                }
+            }
+            _ => {}
+        }
+    }
+    // keep only the tail — giant sessions would bloat memory and first paint
+    const MAX: usize = 400;
+    if out.len() > MAX {
+        let cut = out.len() - MAX;
+        out.drain(..cut);
+        out.insert(0, Entry::Note(format!("… {cut} earlier entries omitted")));
+    }
+    out
+}
+
+/// Local-command echoes and system reminders stored in session files that
+/// aren't real conversation turns.
+fn looks_meta(s: &str) -> bool {
+    let t = s.trim_start();
+    t.starts_with("<local-command")
+        || t.starts_with("<command-")
+        || t.starts_with("Caveat:")
+        || t.starts_with("<system-reminder")
+}
+
+fn expand_home(p: &str) -> String {
+    if p == "~" {
+        return std::env::var("HOME").unwrap_or_else(|_| p.to_string());
+    }
+    if let Some(rest) = p.strip_prefix("~/") {
+        if let Ok(h) = std::env::var("HOME") {
+            return format!("{h}/{rest}");
+        }
+    }
+    p.to_string()
+}
+
+fn byte_at(s: &str, char_idx: usize) -> usize {
+    s.char_indices().nth(char_idx).map(|(i, _)| i).unwrap_or(s.len())
+}
+
+/// Content of the last fenced code block in `text`, if any.
+fn last_code_block(text: &str) -> Option<String> {
+    let mut blocks: Vec<String> = Vec::new();
+    let mut cur: Option<String> = None;
+    for l in text.lines() {
+        if l.trim_start().starts_with("```") {
+            match cur.take() {
+                Some(b) => blocks.push(b),
+                None => cur = Some(String::new()),
+            }
+        } else if let Some(b) = cur.as_mut() {
+            b.push_str(l);
+            b.push('\n');
+        }
+    }
+    blocks.pop()
+}
+
+fn copy_clipboard(text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut child = std::process::Command::new("pbcopy")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(text.as_bytes())?;
+    }
+    child.wait()?;
+    Ok(())
+}
+
 pub enum Msg {
     Input(Event),
     Tick,
@@ -336,7 +550,13 @@ pub struct App {
     pub focus: Focus,
     pub pending: Pending,
     pub input: String,
+    /// Cursor position in `input`, as a char offset.
+    pub input_cursor: usize,
     pub cmd: String,
+    pub search_buf: String,
+    pub search_query: String,
+    /// Transient one-line status (yank feedback, search misses, :cmd results).
+    pub flash: String,
     pub rename_buf: String,
     pub rename_target: RenameTarget,
     pub picker_query: String,
@@ -348,6 +568,7 @@ pub struct App {
     selected: Vec<u64>,
     pending_delete: Vec<u64>,
     pub confirm_msg: String,
+    confirm_action: ConfirmAction,
     pub model_cli: Option<String>,
     pub model_display: String,
     pub dangerous: bool,
@@ -379,10 +600,14 @@ impl App {
         let chat_counter = 1u64;
         let space_counter = 1u64;
 
+        let launch_cwd = std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
         for ps in &restored {
+            let cwd = ps.cwd.clone().unwrap_or_else(|| launch_cwd.clone());
             let mut chats: Vec<Chat> = Vec::new();
             for pc in ps.chats.iter().take(4) {
-                chats.push(Chat::from_persist(next_chat_id, pc));
+                chats.push(Chat::from_persist(next_chat_id, pc, &cwd));
                 next_chat_id += 1;
             }
             if chats.is_empty() {
@@ -395,6 +620,7 @@ impl App {
                 focused: 0,
                 split_dir: SplitDir::V,
                 zoom: false,
+                cwd: ps.cwd.clone(),
             });
             next_space_id += 1;
         }
@@ -406,7 +632,11 @@ impl App {
             focus: Focus::Main,
             pending: Pending::None,
             input: String::new(),
+            input_cursor: 0,
             cmd: String::new(),
+            search_buf: String::new(),
+            search_query: String::new(),
+            flash: String::new(),
             rename_buf: String::new(),
             rename_target: RenameTarget::Space,
             picker_query: String::new(),
@@ -418,6 +648,7 @@ impl App {
             selected: Vec::new(),
             pending_delete: Vec::new(),
             confirm_msg: String::new(),
+            confirm_action: ConfirmAction::DeleteSpaces,
             model_cli,
             model_display,
             dangerous,
@@ -456,6 +687,16 @@ impl App {
         }
         None
     }
+    fn chat_pos(&self, id: u64) -> Option<(usize, usize)> {
+        for (si, sp) in self.spaces.iter().enumerate() {
+            for (ci, c) in sp.chats.iter().enumerate() {
+                if c.id == id {
+                    return Some((si, ci));
+                }
+            }
+        }
+        None
+    }
     fn space_index(&self, id: u64) -> Option<usize> {
         self.spaces.iter().position(|s| s.id == id)
     }
@@ -477,6 +718,7 @@ impl App {
             .iter()
             .map(|sp| PersistSpace {
                 name: sp.name.clone(),
+                cwd: sp.cwd.clone(),
                 chats: sp
                     .chats
                     .iter()
@@ -484,6 +726,7 @@ impl App {
                         title: c.title.clone(),
                         session_id: c.session_id.clone(),
                         cost: c.cost,
+                        model: c.model.clone(),
                     })
                     .collect(),
             })
@@ -497,23 +740,63 @@ impl App {
         match msg {
             Msg::Tick => self.spinner = self.spinner.wrapping_add(1),
             Msg::Input(Event::Key(k)) => self.handle_key(k),
+            Msg::Input(Event::Paste(s)) => self.handle_paste(s),
             Msg::Input(_) => {}
             Msg::Pipe { to, from, message } => self.inject_pipe(to, from, message),
             Msg::Agent { chat, ev } => self.handle_agent(chat, ev),
-            Msg::TurnEnded { chat, error } => {
-                if let Some(c) = self.chat_by_id_mut(chat) {
-                    if c.in_flight {
-                        c.commit_streaming();
-                        c.in_flight = false;
-                        c.follow = true;
+            Msg::TurnEnded { chat, error } => self.turn_ended(chat, error),
+        }
+    }
+
+    fn turn_ended(&mut self, chat: u64, error: Option<String>) {
+        let pos = self.chat_pos(chat);
+        let mut respawn: Option<String> = None;
+        let mut had_error = false;
+        if let Some(c) = self.chat_by_id_mut(chat) {
+            if c.in_flight {
+                c.commit_streaming();
+                c.in_flight = false;
+                c.follow = true;
+            }
+            c.thinking = None;
+            if let Some(e) = error {
+                had_error = true;
+                // a crash between spawning turn one and persisting can leave a
+                // stale --session-id; mint a fresh id and retry the prompt once
+                let el = e.to_lowercase();
+                if !c.session_retry
+                    && el.contains("session")
+                    && (el.contains("already in use") || el.contains("already exists"))
+                {
+                    c.session_retry = true;
+                    c.session_id = Uuid::new_v4().to_string();
+                    c.first_turn = true;
+                    if !c.last_prompt.is_empty() {
+                        c.queued.insert(0, c.last_prompt.clone());
                     }
-                    if let Some(e) = error {
-                        c.transcript.push(Entry::Error(e));
-                    }
+                    c.transcript.push(Entry::Note(
+                        "session id collided — retrying with a fresh session".into(),
+                    ));
+                } else {
+                    c.transcript.push(Entry::Error(e));
                 }
-                self.persist();
+            } else {
+                c.session_retry = false;
+            }
+            if !c.queued.is_empty() {
+                respawn = Some(c.queued.remove(0));
             }
         }
+        if let Some((si, ci)) = pos {
+            if si != self.active_space {
+                self.spaces[si].chats[ci].attention =
+                    Some(if had_error { Attn::Error } else { Attn::Done });
+            }
+            if let Some(prompt) = respawn {
+                self.spawn_for(si, ci, prompt);
+            }
+        }
+        self.persist();
     }
 
     fn handle_agent(&mut self, id: u64, ev: AgentEvent) {
@@ -535,7 +818,21 @@ impl App {
                 }
                 AgentEvent::TextDelta(s) => {
                     c.follow = true;
+                    c.thinking = None;
                     c.streaming.get_or_insert_with(String::new).push_str(&s);
+                }
+                AgentEvent::ThinkingDelta(s) => {
+                    c.follow = true;
+                    let t = c.thinking.get_or_insert_with(String::new);
+                    t.push_str(&s);
+                    // keep a bounded tail — only the last line is rendered
+                    if t.len() > 4000 {
+                        let mut cut = t.len() - 2000;
+                        while cut < t.len() && !t.is_char_boundary(cut) {
+                            cut += 1;
+                        }
+                        *t = t[cut..].to_string();
+                    }
                 }
                 AgentEvent::AssistantFinal(s) => {
                     if c.streaming.as_ref().map_or(true, |x| x.trim().is_empty()) {
@@ -544,17 +841,19 @@ impl App {
                 }
                 AgentEvent::ToolCall { name, input } => {
                     c.commit_streaming();
+                    c.thinking = None;
                     c.transcript.push(Entry::Tool(format_tool(&name, &input)));
                     c.follow = true;
                 }
                 AgentEvent::ToolResult { ok, text } => {
-                    let summary = tool_result_summary(&text);
-                    if !summary.is_empty() {
-                        c.transcript.push(Entry::ToolResult { ok, text: summary });
+                    // store the full text; the UI folds it to one line unless
+                    // the chat's `za` expand toggle is on
+                    if !text.trim().is_empty() {
+                        c.transcript.push(Entry::ToolResult { ok, text });
                         c.follow = true;
                     }
                 }
-                AgentEvent::TurnResult { cost_usd, is_error, text } => {
+                AgentEvent::TurnResult { cost_usd, is_error, text, context_tokens } => {
                     if c.streaming.as_ref().map_or(true, |x| x.trim().is_empty()) {
                         if let Some(t) = text {
                             if !t.trim().is_empty() {
@@ -563,10 +862,16 @@ impl App {
                         }
                     }
                     c.commit_streaming();
+                    c.thinking = None;
                     c.cost += cost_usd;
+                    if context_tokens > 0 {
+                        c.context_tokens = context_tokens;
+                    }
                     c.in_flight = false;
                     if is_error {
                         c.transcript.push(Entry::Error("turn ended with error".into()));
+                    } else {
+                        c.session_retry = false;
                     }
                     c.follow = true;
                 }
@@ -590,6 +895,7 @@ impl App {
         if k.kind == KeyEventKind::Release {
             return;
         }
+        self.flash.clear();
         if self.help_open {
             self.help_open = false;
             return;
@@ -601,6 +907,7 @@ impl App {
             Mode::Insert => self.key_insert(k, ctrl),
             Mode::Picker => self.key_picker(k, ctrl),
             Mode::Confirm => self.key_confirm(k),
+            Mode::Search => self.key_search(k, ctrl),
             Mode::Normal => {
                 if self.pending != Pending::None {
                     self.handle_pending(k);
@@ -609,6 +916,55 @@ impl App {
                 self.key_normal(k, ctrl);
             }
         }
+    }
+
+    fn handle_paste(&mut self, s: String) {
+        let s = s.replace('\r', "\n");
+        match self.mode {
+            Mode::Insert => {
+                let b = byte_at(&self.input, self.input_cursor);
+                self.input.insert_str(b, &s);
+                self.input_cursor += s.chars().count();
+                self.slash_sel = 0;
+            }
+            Mode::Command => self.cmd.push_str(s.replace('\n', " ").trim_end()),
+            Mode::Rename => self.rename_buf.push_str(s.replace('\n', " ").trim_end()),
+            Mode::Picker => self.picker_query.push_str(s.replace('\n', " ").trim_end()),
+            Mode::Search => self.search_buf.push_str(s.replace('\n', " ").trim_end()),
+            _ => {}
+        }
+    }
+
+    // ---- composer editing (char-offset cursor into `input`) ----
+
+    fn input_insert(&mut self, c: char) {
+        let b = byte_at(&self.input, self.input_cursor);
+        self.input.insert(b, c);
+        self.input_cursor += 1;
+    }
+
+    fn input_backspace(&mut self) {
+        if self.input_cursor == 0 {
+            return;
+        }
+        let b = byte_at(&self.input, self.input_cursor - 1);
+        self.input.remove(b);
+        self.input_cursor -= 1;
+    }
+
+    fn input_delete_word(&mut self) {
+        let chars: Vec<char> = self.input.chars().collect();
+        let mut i = self.input_cursor.min(chars.len());
+        while i > 0 && chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        while i > 0 && !chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        let start = byte_at(&self.input, i);
+        let end = byte_at(&self.input, self.input_cursor);
+        self.input.replace_range(start..end, "");
+        self.input_cursor = i;
     }
 
     fn key_command(&mut self, k: KeyEvent, ctrl: bool) {
@@ -671,24 +1027,173 @@ impl App {
                 _ => {}
             }
         }
+        let alt = k.modifiers.contains(KeyModifiers::ALT);
+        let shift = k.modifiers.contains(KeyModifiers::SHIFT);
         match k.code {
             KeyCode::Esc => self.mode = Mode::Normal,
+            KeyCode::Enter if alt || shift => self.input_insert('\n'),
             KeyCode::Enter => self.send_prompt(),
             KeyCode::Backspace => {
-                self.input.pop();
+                self.input_backspace();
+                self.slash_sel = 0;
+            }
+            KeyCode::Left => self.input_cursor = self.input_cursor.saturating_sub(1),
+            KeyCode::Right => {
+                self.input_cursor = (self.input_cursor + 1).min(self.input.chars().count())
+            }
+            KeyCode::Home => self.input_cursor = 0,
+            KeyCode::End => self.input_cursor = self.input.chars().count(),
+            KeyCode::Char('a') if ctrl => self.input_cursor = 0,
+            KeyCode::Char('e') if ctrl => self.input_cursor = self.input.chars().count(),
+            KeyCode::Char('w') if ctrl => {
+                self.input_delete_word();
                 self.slash_sel = 0;
             }
             KeyCode::Char('u') if ctrl => {
                 self.input.clear();
+                self.input_cursor = 0;
                 self.slash_sel = 0;
             }
-            KeyCode::Char('c') if ctrl => self.should_quit = true,
-            KeyCode::Char(c) => {
-                self.input.push(c);
+            KeyCode::Char('c') if ctrl => self.mode = Mode::Normal,
+            KeyCode::Char(c) if !ctrl => {
+                self.input_insert(c);
                 self.slash_sel = 0;
             }
             _ => {}
         }
+    }
+
+    fn key_search(&mut self, k: KeyEvent, ctrl: bool) {
+        match k.code {
+            KeyCode::Esc => {
+                self.search_buf.clear();
+                self.mode = Mode::Normal;
+            }
+            KeyCode::Char('c') if ctrl => {
+                self.search_buf.clear();
+                self.mode = Mode::Normal;
+            }
+            KeyCode::Enter => {
+                self.search_query = self.search_buf.trim().to_string();
+                self.search_buf.clear();
+                self.mode = Mode::Normal;
+                if !self.search_query.is_empty() {
+                    self.search_jump(1);
+                }
+            }
+            KeyCode::Backspace => {
+                self.search_buf.pop();
+            }
+            KeyCode::Char('u') if ctrl => self.search_buf.clear(),
+            KeyCode::Char(c) if !ctrl => self.search_buf.push(c),
+            _ => {}
+        }
+    }
+
+    /// `n` / `N` — jump to the next/prev transcript line matching the search
+    /// query, using the same wrapped lines the renderer produced.
+    fn search_jump(&mut self, dir: isize) {
+        if self.search_query.is_empty() || self.spaces.is_empty() {
+            return;
+        }
+        let q = self.search_query.clone();
+        let case_sensitive = q.chars().any(|c| c.is_uppercase());
+        let ql = q.to_lowercase();
+        let (width, cur) = {
+            let c = self.cur_chat();
+            let cur = if c.follow {
+                c.last_max_scroll as usize
+            } else {
+                c.scroll as usize
+            };
+            (c.last_body_width, cur)
+        };
+        if width == 0 {
+            return;
+        }
+        let matches: Vec<usize> = crate::ui::chat_lines(self.cur_chat(), 0, width)
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| {
+                let text = crate::ui::line_text(l);
+                if case_sensitive {
+                    text.contains(&q)
+                } else {
+                    text.to_lowercase().contains(&ql)
+                }
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if matches.is_empty() {
+            self.flash = format!("no match: {q}");
+            return;
+        }
+        let target = if dir > 0 {
+            *matches.iter().find(|&&m| m > cur).unwrap_or(&matches[0])
+        } else {
+            *matches.iter().rev().find(|&&m| m < cur).unwrap_or(matches.last().unwrap())
+        };
+        let nth = matches.iter().position(|&m| m == target).unwrap_or(0) + 1;
+        let c = self.cur_chat_mut();
+        c.follow = false;
+        c.scroll = target.min(u16::MAX as usize) as u16;
+        self.flash = format!("match {nth}/{}", matches.len());
+    }
+
+    /// `y` / `Y` — copy the last assistant reply (or its last code block).
+    fn yank_last(&mut self, code_block: bool) {
+        if self.focus != Focus::Main || self.spaces.is_empty() {
+            return;
+        }
+        let c = self.cur_chat();
+        let Some(text) = c.transcript.iter().rev().find_map(|e| match e {
+            Entry::Assistant(t) => Some(t.clone()),
+            _ => None,
+        }) else {
+            self.flash = "nothing to yank".into();
+            return;
+        };
+        let out = if code_block {
+            match last_code_block(&text) {
+                Some(b) => b,
+                None => {
+                    self.flash = "no code block in last reply".into();
+                    return;
+                }
+            }
+        } else {
+            text
+        };
+        match copy_clipboard(&out) {
+            Ok(()) => {
+                self.flash = format!(
+                    "yanked {}{} chars",
+                    if code_block { "code block, " } else { "" },
+                    out.chars().count()
+                )
+            }
+            Err(e) => self.flash = format!("yank failed: {e}"),
+        }
+    }
+
+    fn request_quit(&mut self) {
+        let n = self
+            .spaces
+            .iter()
+            .flat_map(|s| &s.chats)
+            .filter(|c| c.in_flight)
+            .count();
+        if n == 0 {
+            self.should_quit = true;
+            return;
+        }
+        self.confirm_msg = if n == 1 {
+            "an agent is still running — quit?   y / n".into()
+        } else {
+            format!("{n} agents still running — quit?   y / n")
+        };
+        self.confirm_action = ConfirmAction::Quit;
+        self.mode = Mode::Confirm;
     }
 
     fn all_slash_commands(&self) -> Vec<String> {
@@ -736,6 +1241,7 @@ impl App {
         let sel = self.slash_sel.min(matches.len().saturating_sub(1));
         if let Some(cmd) = matches.get(sel) {
             self.input = format!("/{cmd} ");
+            self.input_cursor = self.input.chars().count();
         }
         self.slash_sel = 0;
     }
@@ -765,17 +1271,20 @@ impl App {
 
     fn key_confirm(&mut self, k: KeyEvent) {
         match k.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                let ids = std::mem::take(&mut self.pending_delete);
-                for id in ids {
-                    if let Some(i) = self.space_index(id) {
-                        self.delete_space_at(i);
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => match self.confirm_action {
+                ConfirmAction::Quit => self.should_quit = true,
+                ConfirmAction::DeleteSpaces => {
+                    let ids = std::mem::take(&mut self.pending_delete);
+                    for id in ids {
+                        if let Some(i) = self.space_index(id) {
+                            self.delete_space_at(i);
+                        }
                     }
+                    self.selected.clear();
+                    self.mode = Mode::Normal;
+                    self.persist();
                 }
-                self.selected.clear();
-                self.mode = Mode::Normal;
-                self.persist();
-            }
+            },
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 self.pending_delete.clear();
                 self.mode = Mode::Normal;
@@ -804,7 +1313,7 @@ impl App {
             return;
         }
         match k.code {
-            KeyCode::Char('c') if ctrl => self.should_quit = true,
+            KeyCode::Char('c') if ctrl => self.request_quit(),
             KeyCode::Char('h') if ctrl => self.focus_dir(Dir::Left),
             KeyCode::Char('l') if ctrl => self.focus_dir(Dir::Right),
             KeyCode::Char('j') if ctrl => {
@@ -834,16 +1343,34 @@ impl App {
                 self.mode = Mode::Insert;
                 self.cur_chat_mut().follow = true;
             }
-            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('q') => self.request_quit(),
             KeyCode::Char('H') => self.pane_cycle(-1),
             KeyCode::Char('L') => self.pane_cycle(1),
             KeyCode::Char('g') => self.pending = Pending::G,
             KeyCode::Char('z') => self.pending = Pending::Z,
             KeyCode::Char('G') => self.cur_chat_mut().follow = true,
+            KeyCode::Char('y') if self.focus == Focus::Main => self.yank_last(false),
+            KeyCode::Char('Y') if self.focus == Focus::Main => self.yank_last(true),
+            KeyCode::Char('/') if self.focus == Focus::Main => {
+                self.search_buf.clear();
+                self.mode = Mode::Search;
+            }
+            KeyCode::Esc => self.search_query.clear(),
             KeyCode::Char('n') => {
-                self.new_space();
-                self.focus = Focus::Main;
-                self.mode = Mode::Insert;
+                // after a `/` search, n navigates matches; Esc clears the
+                // search and restores n = new space
+                if self.focus == Focus::Main && !self.search_query.is_empty() {
+                    self.search_jump(1);
+                } else {
+                    self.new_space();
+                    self.focus = Focus::Main;
+                    self.mode = Mode::Insert;
+                }
+            }
+            KeyCode::Char('N') if self.focus == Focus::Main => {
+                if !self.search_query.is_empty() {
+                    self.search_jump(-1);
+                }
             }
             KeyCode::Char('a') if self.focus == Focus::Sidebar => self.new_named_space(),
             KeyCode::Char('r') => self.rename_start(),
@@ -915,9 +1442,17 @@ impl App {
             }
             Pending::Z => {
                 self.pending = Pending::None;
-                if let KeyCode::Char('z') = k.code {
-                    // recenter on the newest activity (the working line)
-                    self.cur_chat_mut().follow = true;
+                match k.code {
+                    KeyCode::Char('z') => {
+                        // recenter on the newest activity (the working line)
+                        self.cur_chat_mut().follow = true;
+                    }
+                    KeyCode::Char('a') => {
+                        // fold-toggle: expand/collapse tool results
+                        let c = self.cur_chat_mut();
+                        c.expand_tools = !c.expand_tools;
+                    }
+                    _ => {}
                 }
             }
             Pending::Leader => match k.code {
@@ -1212,6 +1747,7 @@ impl App {
         let sname = self.next_space_name();
         let mut sp = Space::one(sid, chat);
         sp.name = sname;
+        sp.cwd = self.spaces[ai].cwd.clone();
         self.spaces.push(sp);
         self.active_space = self.spaces.len() - 1;
         self.sidebar_cursor = self.active_space;
@@ -1333,6 +1869,7 @@ impl App {
     }
 
     fn request_delete(&mut self) {
+        self.confirm_action = ConfirmAction::DeleteSpaces;
         let ids: Vec<u64> = if !self.selected.is_empty() {
             self.selected.clone()
         } else if let Some(id) = self.sel_space_id() {
@@ -1450,8 +1987,16 @@ impl App {
         let cmd = self.cmd.trim().to_string();
         self.cmd.clear();
         self.mode = Mode::Normal;
-        match cmd.as_str() {
+        let (head, rest) = match cmd.split_once(char::is_whitespace) {
+            Some((h, r)) => (h, r.trim()),
+            None => (cmd.as_str(), ""),
+        };
+        match head {
             "q" | "quit" => {
+                self.request_quit();
+                return;
+            }
+            "q!" | "quit!" => {
                 self.should_quit = true;
                 return;
             }
@@ -1460,8 +2005,9 @@ impl App {
                 self.mode = Mode::Insert;
                 return;
             }
-            "w" | "ws" | "write" => {
+            "w" | "ws" | "write" if rest.is_empty() => {
                 self.persist();
+                self.flash = "state saved".into();
                 return;
             }
             _ => {}
@@ -1469,19 +2015,108 @@ impl App {
         if self.spaces.is_empty() {
             return;
         }
-        match cmd.as_str() {
+        match head {
+            // :w <file> — export the focused chat's transcript as markdown
+            "w" | "write" => self.export_transcript(rest),
             "close" => self.close_focused_pane(),
             "pop" => self.pop_chat(),
             "vsplit" | "vs" => self.spaces[self.active_space].split_dir = SplitDir::V,
             "split" | "sp" => self.spaces[self.active_space].split_dir = SplitDir::H,
-            _ => {}
+            "cd" => self.set_space_cwd(rest),
+            "all" => self.broadcast(rest),
+            "model" => self.set_chat_model(rest),
+            _ => self.flash = format!("unknown command: :{head}"),
         }
     }
 
+    fn export_transcript(&mut self, path: &str) {
+        if path.is_empty() {
+            self.flash = "usage: :w <file>".into();
+            return;
+        }
+        let path = expand_home(path);
+        let c = self.cur_chat();
+        let mut out = format!("# {}\n\n", chat_title(c));
+        for e in &c.transcript {
+            match e {
+                Entry::User(t) => out.push_str(&format!("## you\n\n{t}\n\n")),
+                Entry::Assistant(t) => out.push_str(&format!("## claude\n\n{t}\n\n")),
+                Entry::Tool(t) => {
+                    out.push_str(&format!("> {}\n\n", t.replace('\n', "\n> ")))
+                }
+                Entry::ToolResult { ok, text } => {
+                    let first = tool_result_summary(text);
+                    let tag = if *ok { "" } else { "ERROR: " };
+                    out.push_str(&format!("> ⎿ {tag}{first}\n\n"));
+                }
+                Entry::Note(t) => out.push_str(&format!("_{t}_\n\n")),
+                Entry::Error(t) => out.push_str(&format!("**error:** {t}\n\n")),
+            }
+        }
+        match std::fs::write(&path, out) {
+            Ok(()) => self.flash = format!("wrote {path}"),
+            Err(e) => self.flash = format!("write failed: {e}"),
+        }
+    }
+
+    /// :cd <dir> — set the active space's working directory (empty resets).
+    fn set_space_cwd(&mut self, path: &str) {
+        if path.is_empty() {
+            self.spaces[self.active_space].cwd = None;
+            self.flash = "cwd reset to launch dir".into();
+            self.persist();
+            return;
+        }
+        let expanded = expand_home(path);
+        match std::fs::canonicalize(&expanded) {
+            Ok(p) if p.is_dir() => {
+                let s = p.display().to_string();
+                self.spaces[self.active_space].cwd = Some(s.clone());
+                self.flash = format!("cwd: {s}");
+                self.persist();
+            }
+            _ => self.flash = format!("not a directory: {expanded}"),
+        }
+    }
+
+    /// :all <prompt> — send one prompt to every chat in the active space.
+    fn broadcast(&mut self, prompt: &str) {
+        if prompt.is_empty() {
+            self.flash = "usage: :all <prompt>".into();
+            return;
+        }
+        let ai = self.active_space;
+        let n = self.spaces[ai].chats.len();
+        for ci in 0..n {
+            if self.spaces[ai].chats[ci].in_flight {
+                self.spaces[ai].chats[ci].queued.push(prompt.to_string());
+            } else {
+                self.spawn_for(ai, ci, prompt.to_string());
+            }
+        }
+        self.flash = format!("sent to {n} chat{}", if n == 1 { "" } else { "s" });
+    }
+
+    /// :model <name> — per-chat model override (empty resets to default).
+    fn set_chat_model(&mut self, name: &str) {
+        let ai = self.active_space;
+        let fi = self.spaces[ai].fi();
+        if name.is_empty() {
+            self.spaces[ai].chats[fi].model = None;
+            self.flash = format!("model: default ({})", self.model_display);
+        } else {
+            self.spaces[ai].chats[fi].model = Some(name.to_string());
+            self.flash = format!("model: {name} (this chat)");
+        }
+        self.persist();
+    }
+
     fn env_prompt_for(&self, si: usize, ci: usize) -> String {
-        let cwd = std::env::current_dir()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default();
+        let cwd = self.spaces[si].cwd.clone().unwrap_or_else(|| {
+            std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
+        });
         let me = chat_title(&self.spaces[si].chats[ci]);
         let my_space = space_name(&self.spaces[si]);
         let others: Vec<String> = self
@@ -1515,17 +2150,27 @@ Working directory: {cwd}. You're in a terminal on macOS (tmux/Ghostty) — keep 
             return;
         }
         let dangerous = self.dangerous;
-        let model = self.model_cli.clone();
+        let model = self.spaces[si].chats[ci]
+            .model
+            .clone()
+            .or_else(|| self.model_cli.clone());
         let tx = self.tx.clone();
         let sysp = self.env_prompt_for(si, ci);
         let sname = space_name(&self.spaces[si]);
+        let cwd = self.spaces[si].cwd.clone();
         let pipe = std::env::var("AEOVIM_PIPE").ok();
         let spec = {
             let c = &mut self.spaces[si].chats[ci];
+            if c.first_turn && !c.autonamed {
+                c.title = slug(&prompt);
+            }
             c.transcript.push(Entry::User(prompt.clone()));
             c.streaming = None;
+            c.thinking = None;
+            c.attention = None;
             c.in_flight = true;
             c.follow = true;
+            c.last_prompt = prompt.clone();
             let spec = TurnSpec {
                 chat: c.id,
                 prompt,
@@ -1537,6 +2182,7 @@ Working directory: {cwd}. You're in a terminal on macOS (tmux/Ghostty) — keep 
                 append_system_prompt: Some(sysp),
                 space_name: sname,
                 pipe_path: pipe,
+                cwd,
             };
             c.first_turn = false;
             spec
@@ -1558,19 +2204,33 @@ Working directory: {cwd}. You're in a terminal on macOS (tmux/Ghostty) — keep 
             c.transcript.clear();
             c.transcript.push(Entry::Note("cleared".into()));
             c.streaming = None;
+            c.thinking = None;
             c.cost = 0.0;
+            c.context_tokens = 0;
+            c.queued.clear();
+            c.attention = None;
+            c.session_retry = false;
             c.first_turn = true;
             c.session_id = Uuid::new_v4().to_string();
             self.input.clear();
+            self.input_cursor = 0;
             self.mode = Mode::Normal;
             self.persist();
             return;
         }
+        self.input.clear();
+        self.input_cursor = 0;
+        self.mode = Mode::Normal;
         if self.spaces[ai].chats[fi].in_flight {
+            // type-ahead: queue and auto-send when the current turn finishes
+            let c = &mut self.spaces[ai].chats[fi];
+            c.queued.push(prompt);
+            c.transcript.push(Entry::Note(format!(
+                "queued — will send when this turn finishes ({} waiting)",
+                c.queued.len()
+            )));
             return;
         }
-        self.input.clear();
-        self.mode = Mode::Normal;
         self.spawn_for(ai, fi, prompt);
     }
 
@@ -1596,13 +2256,16 @@ Working directory: {cwd}. You're in a terminal on macOS (tmux/Ghostty) — keep 
         } else {
             from.trim().to_string()
         };
+        let prompt = format!("[message from space \"{who}\" via aeovim pipe]\n{message}");
         if self.spaces[si].chats[ci].in_flight {
-            self.spaces[si].chats[ci]
-                .transcript
-                .push(Entry::Note(format!("pipe from {who} (queued — busy): {message}")));
+            // deliver when the current turn finishes (drained in turn_ended)
+            let c = &mut self.spaces[si].chats[ci];
+            c.queued.push(prompt);
+            c.transcript.push(Entry::Note(format!(
+                "pipe from {who} queued — delivering when this turn finishes"
+            )));
             return;
         }
-        let prompt = format!("[message from space \"{who}\" via aeovim pipe]\n{message}");
         self.spawn_for(si, ci, prompt);
     }
 }

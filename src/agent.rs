@@ -29,6 +29,8 @@ pub struct TurnSpec {
     /// This chat's space name + the inter-agent pipe path (env for the child).
     pub space_name: String,
     pub pipe_path: Option<String>,
+    /// Working directory for the child (per-space `:cd`); None = inherit.
+    pub cwd: Option<String>,
 }
 
 /// Resolve the claude binary. `Command` execs by PATH lookup and ignores shell
@@ -65,6 +67,9 @@ pub fn spawn_turn(spec: TurnSpec, tx: UnboundedSender<Msg>) {
         if let Some(model) = &spec.model {
             cmd.arg("--model").arg(model);
         }
+        if let Some(cwd) = &spec.cwd {
+            cmd.current_dir(cwd);
+        }
         if spec.first {
             cmd.arg("--session-id").arg(&spec.session_id);
         } else {
@@ -89,6 +94,18 @@ pub fn spawn_turn(spec: TurnSpec, tx: UnboundedSender<Msg>) {
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
 
+        // Read stderr concurrently: a child that fills the stderr pipe while we
+        // are still consuming stdout would otherwise block forever.
+        let err_task = tokio::spawn(async move {
+            let mut errbuf = String::new();
+            let mut errlines = BufReader::new(stderr).lines();
+            while let Ok(Some(l)) = errlines.next_line().await {
+                errbuf.push_str(&l);
+                errbuf.push('\n');
+            }
+            errbuf
+        });
+
         let mut lines = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             for ev in parse_line(&line) {
@@ -98,12 +115,7 @@ pub fn spawn_turn(spec: TurnSpec, tx: UnboundedSender<Msg>) {
             }
         }
 
-        let mut errbuf = String::new();
-        let mut errlines = BufReader::new(stderr).lines();
-        while let Ok(Some(l)) = errlines.next_line().await {
-            errbuf.push_str(&l);
-            errbuf.push('\n');
-        }
+        let errbuf = err_task.await.unwrap_or_default();
 
         let error = match child.wait().await {
             Ok(status) if status.success() => None,

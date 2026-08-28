@@ -10,7 +10,7 @@ v1 wraps the `claude` CLI (Claude Code) as child processes over headless `stream
 
 ## Status
 
-**Working walking skeleton — installable and in daily use.** ~3,200 lines of Rust across seven modules; builds, installs, and drives real multi-turn Claude Code sessions. This is well past the "pre-implementation" the earlier README claimed. The orchestration layer (fan-out, job board, diff review) is designed but not yet built — see the split below.
+**Working walking skeleton — installable and in daily use.** ~4,200 lines of Rust across seven modules; builds, installs, and drives real multi-turn Claude Code sessions. This is well past the "pre-implementation" the earlier README claimed. The orchestration layer (fan-out, job board, diff review) is designed but not yet built — see the split below.
 
 ### What works today
 
@@ -20,8 +20,13 @@ v1 wraps the `claude` CLI (Claude Code) as child processes over headless `stream
 - **Streaming transcript:** assistant messages, a thinking spinner, and Claude-style tool-call / tool-result rendering; slash-command popup; inline markdown; mode indicator; powerline status bar.
 - **Navigation:** `Ctrl-hjkl` focus panes ↔ sidebar, `Tab` / `H` / `L` cycle chats, `Space 1-0` jump to a Space, sidebar add / rename / delete.
 - **Space ops:** merge multiple Spaces (chats combined, ≤4), pop a chat into its own Space, split management.
-- **Persistence:** Spaces (name + chats) saved per tmux session at `~/.local/state/aeovim/<session>.json`; relaunch resumes.
-- **Inter-agent pipe:** a FIFO (`~/.local/state/aeovim/<key>.pipe`) lets one agent message another Space; a reader thread routes it into the target chat's transcript and the agent responds.
+- **Persistence + transcript restore:** Spaces (name, cwd, chats, per-chat model) saved per tmux session at `~/.local/state/aeovim/<session>.json`; relaunch resumes and replays each chat's history from Claude Code's stored session files.
+- **Inter-agent pipe:** a FIFO (`~/.local/state/aeovim/<key>.pipe`) lets one agent message another Space; a reader thread routes it into the target chat's transcript and the agent responds. Messages to a busy chat queue and deliver when its turn finishes.
+- **Prompt queueing & attention:** type-ahead prompts queue while a chat is busy and auto-send in order; chats auto-title from their first prompt; the sidebar flags background spaces that finish (`✦`) or error (`!`).
+- **Transcript tools:** `/` search with `n`/`N` (Esc clears), `y`/`Y` yank the last reply / its last code block to the clipboard, `za` expands tool results, `:w file.md` exports markdown. Extended thinking streams dim while the agent reasons.
+- **Per-space `:cd`** (agents run in that directory), per-chat `:model`, `:all <prompt>` broadcast to every pane in the space; statusline shows model, permissions, cost, and context tokens.
+- **Composer:** multi-line input (Alt-Enter), cursor editing (arrows, Ctrl-a/e/w), bracketed paste — pasted newlines never fire the prompt early.
+- **Safety:** quitting (or Ctrl-c) with agents mid-turn asks for confirmation; `:q!` forces.
 - **Permissions:** dangerous by default (`--dangerously-skip-permissions`); `--safe` switches to `--permission-mode acceptEdits`.
 
 ### Designed, not yet built
